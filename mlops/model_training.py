@@ -9,7 +9,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics import (
-    fbeta_score, classification_report, precision_score, 
+    fbeta_score, classification_report, precision_score, accuracy_score, f1_score,
     recall_score, roc_auc_score, confusion_matrix, ConfusionMatrixDisplay
 )
 from transformers import DistilBertTokenizer, DistilBertModel
@@ -17,7 +17,7 @@ from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
 import matplotlib.pyplot as plt
-
+from cache import EmbeddingCache
 # MLflow imports
 import mlflow
 import mlflow.sklearn
@@ -26,19 +26,30 @@ import mlflow.lightgbm
 from mlflow.models.signature import infer_signature
 from mlflow.tracking import MlflowClient
 import mlflow.pyfunc
-
+import os
+import time
 # Optuna imports
 import optuna
 from optuna.integration.mlflow import MLflowCallback
 
-# Prefect imports (optional - remove if not using)
-from prefect import task, flow
+from prefect import task
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-DATA_PATH = "../data/training_data_with_history.parquet"
-ARTIFACTS_DIR = "../api_service/artifacts"
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Construct paths relative to the script, not the terminal
+# Go up one level (..) to root, then down into data/ or api_service/
+DATA_PATH = os.path.join(SCRIPT_DIR, "../data/training_data_with_history.parquet")
+EMBEDDING_PATH = os.path.join(SCRIPT_DIR, "../cache")
+ARTIFACTS_DIR = os.path.join(SCRIPT_DIR, "../api_service/artifacts")
+# DATA_PATH = "../data/training_data_with_history.parquet"
+# ARTIFACTS_DIR = "../api_service/artifacts"
+# S3_BUCKET='cyberbullying-artifacts-victor-obi'
+S3_BUCKET='s3://cyberbullying-artifacts-victor-obi/mlflow'
+
 SVD_COMPONENTS = 128
 RANDOM_STATE = 42
 EXPERIMENT_NAME = "cyberbullying-detection"
@@ -114,19 +125,29 @@ class CyberBullyingModelWrapper(mlflow.pyfunc.PythonModel):
 # ==========================================
 # TEXT EMBEDDINGS
 # ==========================================
-def get_bert_embeddings(text_list, batch_size=64):
+def get_bert_embeddings(text_list, batch_size=32):
     """
     Generate DistilBERT embeddings in batches.
     Returns numpy array of shape (N, 768).
     """
     print("   -> Loading DistilBERT Model...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Device selection
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")  
+    else:
+        device = torch.device("cpu")
+    
     tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
     model = DistilBertModel.from_pretrained('distilbert-base-uncased').to(device)
     model.eval()
     
-    all_embeddings = []
-    total = len(text_list)
+    total = len(text_list) 
+    
+    # ✅ Pre-allocate array (memory efficient)
+    all_embeddings = np.zeros((total, 768), dtype=np.float32)
     
     print(f"   -> Vectorizing {total} messages on {device}...")
     
@@ -144,22 +165,36 @@ def get_bert_embeddings(text_list, batch_size=64):
         with torch.no_grad():
             outputs = model(**inputs)
             
-        embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-        all_embeddings.append(embeddings)
+        batch_vectors = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+        
+        current_batch_len = len(batch_vectors)
+        all_embeddings[i : i + current_batch_len] = batch_vectors
+        
+        
+        del inputs, outputs, batch_vectors
         
         if i % 1000 == 0 and i > 0:
             print(f"      Processed {i}/{total}...")
+            import gc
+            gc.collect()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            elif device.type == 'mps':
+                torch.mps.empty_cache()
     
+    del model, tokenizer
     if device.type == 'cuda':
         torch.cuda.empty_cache()
-            
-    return np.vstack(all_embeddings)
+    elif device.type == 'mps':
+        torch.mps.empty_cache()
+    
+    return all_embeddings 
 
 # ==========================================
 # DATA PREPARATION
 # ==========================================
 @task(log_prints=True)
-def load_and_prepare_data():
+def load_and_prepare_data(force_recompute=False):
     """Load data and prepare features"""
     print("\n1. Loading Data...")
     df = pd.read_parquet(DATA_PATH)
@@ -175,8 +210,51 @@ def load_and_prepare_data():
     
     # Text Processing
     print("\n2. Text Processing with DistilBERT...")
-    raw_text = df['text'].astype(str).tolist()
-    vectors_768 = get_bert_embeddings(raw_text)
+    
+    CACHE_DIR = "/Users/chidera/Projects/cyberbullying-bot/cache"
+    LOCAL_EMBEDDINGS = os.path.join(CACHE_DIR, 'bert_embeddings.pkl')
+    LOCAL_METADATA = os.path.join(CACHE_DIR, 'cache_metadata.json')
+    print(LOCAL_EMBEDDINGS)
+    print(LOCAL_METADATA)
+    has_local_cache = os.path.exists(LOCAL_EMBEDDINGS) and os.path.exists(LOCAL_METADATA)
+    s3_bucket = S3_BUCKET  
+
+    if has_local_cache:
+        print("   📁 Local cache detected - using local-only mode")
+        use_s3 = False
+    else:
+        print("   🪣 No local cache - enabling S3 sync")
+        use_s3 = True
+    if os.path.exists(os.path.join(EMBEDDING_PATH, 'bert_embeddings.pkl')):
+        s3_bucket = None
+    cache = EmbeddingCache(
+        cache_dir="/Users/chidera/Projects/cyberbullying-bot/cache",
+        s3_bucket=s3_bucket, 
+        use_s3=use_s3,
+        s3_prefix="embeddings-cache"
+    )
+
+    if not force_recompute:
+        print("    Using cached embeddings (data unchanged)")
+        vectors_768, cache_metadata = cache.load_embeddings()
+    else:
+        if force_recompute: 
+            print("    Force recompute enabled - generating new embeddings")
+        else:
+            print("    Data changed - generating new embeddings")
+        
+        raw_text = df['text'].astype(str).tolist()
+        vectors_768 = get_bert_embeddings(raw_text)
+        
+        # Save to cache (both local and S3)
+        cache.save_embeddings(
+            vectors_768, 
+            DATA_PATH,
+            additional_info={'num_texts': len(raw_text)}
+        )
+
+    # raw_text = df['text'].astype(str).tolist()
+    # vectors_768 = get_bert_embeddings(raw_text)
     
     # Dimensionality Reduction
     print(f"   -> Applying TruncatedSVD (768 -> {SVD_COMPONENTS})...")
@@ -304,13 +382,20 @@ def create_xgboost_objective(X_train, y_train, X_val, y_val, scale_pos_weight):
             'scale_pos_weight': scale_pos_weight,
             'eval_metric': 'aucpr',
             'random_state': RANDOM_STATE,
-            'n_jobs': -1
+            'n_jobs': 1
         }
         
         model = XGBClassifier(**params)
         model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
         
         preds = model.predict(X_val)
+        acc = accuracy_score(y_val, preds)           # Extra Info
+        recall = recall_score(y_val, preds)          
+        f_score = f1_score(y_val, preds)
+
+        mlflow.log_metric('f1_score', f_score)
+        mlflow.log_metric("accuracy", acc)
+        mlflow.log_metric("recall", recall)
         return fbeta_score(y_val, preds, beta=2)
     
     return objective
@@ -330,6 +415,14 @@ def create_logistic_objective(X_train, y_train, X_val, y_val):
         
         # 3. Evaluate
         preds = model.predict(X_val)
+        acc = accuracy_score(y_val, preds)           
+        recall = recall_score(y_val, preds)          
+        f_score = f1_score(y_val, preds)
+        
+        mlflow.log_metric('f1_score', f_score)
+        mlflow.log_metric("accuracy", acc)
+        mlflow.log_metric("recall", recall)
+
         return fbeta_score(y_val, preds, beta=2)
     
     return objective
@@ -348,13 +441,20 @@ def create_lightgbm_objective(X_train, y_train, X_val, y_val):
             'class_weight': 'balanced',
             'random_state': RANDOM_STATE,
             'verbose': -1,
-            'n_jobs': -1
+            'n_jobs': 1
         }
         
         model = LGBMClassifier(**params)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
         
         preds = model.predict(X_val)
+        acc = accuracy_score(y_val, preds)           
+        recall = recall_score(y_val, preds)         
+        f_score = f1_score(y_val, preds)
+
+        mlflow.log_metric('f1_score', f_score)
+        mlflow.log_metric("accuracy", acc)
+        mlflow.log_metric("recall", recall)
         return fbeta_score(y_val, preds, beta=2)
     
     return objective
@@ -363,8 +463,12 @@ def create_lightgbm_objective(X_train, y_train, X_val, y_val):
 # MODEL TRAINING
 # ==========================================
 @task(log_prints=True)
-def train_xgboost(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=50):
+def train_xgboost(X_train, y_train, X_val, y_val, X_test, y_test,scale_pos_weight, n_trials=50):
     print("\n Tuning XGBoost with Optuna...")
+    
+    mlflow_callback = MLflowCallback(metric_name='f2_score',
+                                     create_experiment=False,
+                                     mlflow_kwargs={"nested": True})
     
     study = optuna.create_study(
         direction='maximize',
@@ -373,21 +477,24 @@ def train_xgboost(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=50):
     )
     
     study.optimize(
-        create_xgboost_objective(X_train, y_train, X_val, y_val),
+        create_xgboost_objective(X_train, y_train, X_val, y_val, scale_pos_weight),
         n_trials=n_trials,
+        callbacks=[mlflow_callback],
         show_progress_bar=True
     )
     
     print(f"   Best F2: {study.best_value:.4f}")
     
+    if mlflow.active_run():
+        mlflow.end_run()
     # Train final model with best params
     with mlflow.start_run(run_name="xgboost_best") as run:
         best_params = study.best_params.copy()
         best_params.update({
-            
+            'scale_pos_weight': scale_pos_weight,
             'eval_metric': 'aucpr',
             'random_state': RANDOM_STATE,
-            'n_jobs': -1
+            'n_jobs': 1
         })
         
         model = XGBClassifier(**best_params)
@@ -428,19 +535,146 @@ def train_xgboost(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=50):
             "scaler_path": f"{ARTIFACTS_DIR}/scaler.pkl"
         }
 
+        # print(f"   🔍 Verifying artifact files:")
+        # for key, path in artifacts.items():
+        #     exists = os.path.exists(path)
+        #     size = os.path.getsize(path) if exists else 0
+        #     print(f"      {key}: exists={exists}, size={size:,} bytes, path={path}")
+        #     if not exists:
+        #         raise FileNotFoundError(f"CRITICAL: {key} not found at {path}")
+        
+        # print(f"   🔍 Testing CyberBullyingModelWrapper...")
+        # try:
+        #     test_wrapper = CyberBullyingModelWrapper()
+        #     print(f"      ✅ Wrapper instantiated")
+        # except Exception as e:
+        #     print(f"      ❌ Wrapper failed: {e}")
+        #     raise
+        
+        # # Create signature
+        # print(f"   🔍 Creating signature...")
+        # try:
+        #     signature = infer_signature(X_train, model.predict_proba(X_train))
+        #     print(f"      ✅ Signature created")
+        # except Exception as e:
+        #     print(f"      ❌ Signature failed: {e}")
+        #     raise
         signature = infer_signature(X_train, model.predict_proba(X_train))
         mlflow.pyfunc.log_model(
-            artifact_path="model",
+            name="model",
             python_model=CyberBullyingModelWrapper(), 
             artifacts=artifacts,                 
             signature=signature,
-            pip_requirements=["torch", "transformers", "scikit-learn", "xgboost"]
+            pip_requirements=["torch", "transformers", "scikit-learn", "xgboost", 'joblib']
         )
+        print(f"   📦 Logging model to MLflow...")
+        # try:
+        #     mlflow.pyfunc.log_model(
+        #         artifact_path="model",
+        #         python_model=CyberBullyingModelWrapper(), 
+        #         artifacts=artifacts,
+        #         signature=signature,
+        #         pip_requirements=["torch", "transformers", "scikit-learn", "xgboost", 'joblib']
+        #     )
+        # except Exception as e:
+        #     print(f"   ❌ Model logging failed: {e}")
+        #     import traceback
+        #     traceback.print_exc()
+            
+        #     print(f"\n   🔄 Trying fallback: mlflow.xgboost.log_model...")
+        #     try:
+        #         mlflow.xgboost.log_model(
+        #             model,
+        #             artifact_path="model",
+        #             signature=signature
+        #         )
+        #         print(f"      ✅ Fallback succeeded")
+        #     except Exception as e2:
+        #         print(f"      ❌ Fallback also failed: {e2}")
+        #         raise
+        # mlflow.xgboost.log_model(model,artifact_path="model",signature=signature)
+        
+        # # ✅ FIX 3: Verify with client
+        # client = MlflowClient()
+        # run_id = run.info.run_id
+
+        # print(f"   ⏳ Verifying model artifacts for run {run_id}...")
+        # time.sleep(3)  # Give MLflow time to write to storage
+
+        # # Verify the model artifact exists
+        # try:
+        #     artifacts = client.list_artifacts(run_id, path="model")
+        #     if not artifacts:
+        #         raise ValueError(f"No model artifacts found at path 'model'")
+        #     print(f"   ✅ Model artifacts verified: {[a.path for a in artifacts]}")
+        # except Exception as e:
+        #     print(f"   ❌ Artifact verification failed: {e}")
+        #     raise
+        
+        # mlflow.xgboost.log_model(model, artifact_path="model", signature=signature)
+        
+        # CRITICAL: Verify model was logged with retry logic (handles S3 sync delay)
+        run_id = run.info.run_id
+        # client = MlflowClient()
+        
+        # print(f"   ⏳ Verifying model artifacts for run {run_id}...")
+        # max_retries = 10
+        # artifacts_found = False
+        
+        # for attempt in range(max_retries):
+        #     time.sleep(2)  # Wait before checking
+        #     try:
+        #         artifacts = client.list_artifacts(run_id, path="model")
+        #         if artifacts:
+        #             print(f"   ✅ Model artifacts verified (attempt {attempt + 1}/{max_retries})")
+        #             print(f"      Found: {[a.path for a in artifacts]}")
+        #             artifacts_found = True
+        #             break
+        #     except Exception as e:
+        #         if attempt < max_retries - 1:
+        #             print(f"   ⏳ Waiting for artifacts... (attempt {attempt + 1}/{max_retries})")
+        #         else:
+        #             print(f"   ❌ Verification failed after {max_retries} attempts: {e}")
+        #             raise ValueError(f"Model artifacts not found after {max_retries} attempts")
+        
+        # if not artifacts_found:
+        #     raise ValueError(f"Failed to verify model artifacts for run {run_id}")
         
         mlflow.set_tag("model_type", "xgboost")
         
-        run_id = run.info.run_id
         run_uuid = run.info.artifact_uri.split('/')[-2]
+
+        # Try multiple times (S3 eventual consistency)
+        # max_retries = 5
+        # for attempt in range(max_retries):
+        #     try:
+        #         artifacts_list = client.list_artifacts(run_id)
+        #         artifact_paths = [a.path for a in artifacts_list]
+                
+        #         if "model" in artifact_paths:
+        #             print(f"   ✅ Model found in MLflow (attempt {attempt + 1})")
+        #             # Verify model subfolder
+        #             model_artifacts = client.list_artifacts(run_id, path="model")
+        #             print(f"   📂 Model contents: {[a.path for a in model_artifacts]}")
+        #             break
+        #         else:
+        #             if attempt < max_retries - 1:
+        #                 print(f"   ⏳ Model not found yet, waiting... (attempt {attempt + 1})")
+        #                 time.sleep(2)
+        #             else:
+        #                 raise ValueError(f"Model not found after {max_retries} attempts! Available: {artifact_paths}")
+        #     except Exception as e:
+        #         if attempt < max_retries - 1:
+        #             print(f"   ⚠️  Verification attempt {attempt + 1} failed: {e}")
+        #             time.sleep(2)
+        #         else:
+        #             raise
+
+        
+        # mlflow.set_tag("model_type", "xgboost")
+        
+        # run_id = run.info.run_id
+        # run_uuid = run.info.artifact_uri.split('/')[-2]
         
         print(f"   ✅ XGBoost F2: {test_metrics['f2_score']:.4f}")
         
@@ -450,21 +684,29 @@ def train_xgboost(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=50):
 def train_logistic(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=50):
     print("Tuning Logictic Regression")
 
+    mlflow_callback = MLflowCallback(metric_name='f2_score',
+                                     create_experiment=False,
+                                     mlflow_kwargs={"nested": True})
+    
     study = optuna.create_study(direction='maximize',
                                 study_name='logistic_optimization',
                                 sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
     
     study.optimize(create_logistic_objective(X_train, y_train, X_val, y_val),
                    n_trials=n_trials,
+                   callbacks=[mlflow_callback],
                    show_progress_bar=True)
     
     print(f"   Best F2: {study.best_value:.4f}")
+
+    if mlflow.active_run():
+        mlflow.end_run()
 
     with mlflow.start_run(run_name='logistic_reg_best') as run:
         best_params = study.best_params.copy()
         
         model = LogisticRegression(**best_params)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        model.fit(X_train, y_train)
 
         optimal_threshold, _ = optimize_threshold(model, X_val, y_val, beta=2)
 
@@ -498,20 +740,125 @@ def train_logistic(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=50):
             "svd_path": f"{ARTIFACTS_DIR}/svd_transformer.pkl",
             "scaler_path": f"{ARTIFACTS_DIR}/scaler.pkl"
         }
+        # artifacts = {
+        #     "model_path": "xgboost_model.pkl",
+        #     "threshold_path": "xgboost_threshold.pkl", 
+        #     "svd_path": "svd_transformer.pkl",
+        #     "scaler_path": "scaler.pkl"
+        # }
 
         signature = infer_signature(X_train, model.predict_proba(X_train))
         
         mlflow.pyfunc.log_model(
-            artifact_path="model",
+            name="model",
             python_model=CyberBullyingModelWrapper(), 
             artifacts=artifacts,                 
             signature=signature,
-            pip_requirements=["torch", "transformers", "scikit-learn", "logistic_reg"]
+            pip_requirements=["torch", "transformers", "scikit-learn", "joblib"]
         )
+
+        # print(f"   📦 Logging model to MLflow...")
+        # try:
+        #     mlflow.pyfunc.log_model(
+        #         artifact_path="model",
+        #         python_model=CyberBullyingModelWrapper(), 
+        #         artifacts=artifacts,
+        #         signature=signature,
+        #         pip_requirements=["torch", "transformers", "scikit-learn", 'joblib']
+        #     )
+        # except Exception as e:
+        #     print(f"   ❌ Model logging failed: {e}")
+        #     import traceback
+        #     traceback.print_exc()
+        #     raise
+
+        # mlflow.sklearn.log_model(model,artifact_path="model",signature=signature)
+
+        # print(f"   ⏳ Waiting for S3 sync...")
+        # time.sleep(3)  # Give S3 time to sync
+        
+        # # ✅ FIX 3: Verify with client
+        # client = MlflowClient()
+        # run_id = run.info.run_id
+        
+        # # Try multiple times (S3 eventual consistency)
+        # max_retries = 5
+        # for attempt in range(max_retries):
+        #     try:
+        #         artifacts_list = client.list_artifacts(run_id)
+        #         artifact_paths = [a.path for a in artifacts_list]
+                
+        #         if "model" in artifact_paths:
+        #             print(f"   ✅ Model found in MLflow (attempt {attempt + 1})")
+        #             # Verify model subfolder
+        #             model_artifacts = client.list_artifacts(run_id, path="model")
+        #             print(f"   📂 Model contents: {[a.path for a in model_artifacts]}")
+        #             break
+        #         else:
+        #             if attempt < max_retries - 1:
+        #                 print(f"   ⏳ Model not found yet, waiting... (attempt {attempt + 1})")
+        #                 time.sleep(2)
+        #             else:
+        #                 raise ValueError(f"Model not found after {max_retries} attempts! Available: {artifact_paths}")
+        #     except Exception as e:
+        #         if attempt < max_retries - 1:
+        #             print(f"   ⚠️  Verification attempt {attempt + 1} failed: {e}")
+        #             time.sleep(2)
+        #         else:
+        #             raise
+
+        # run_id = run.info.run_id
+        # client = MlflowClient()
+
+        # print(f"   ⏳ Verifying model artifacts for run {run_id}...")
+        # time.sleep(3)  # Give MLflow time to write to storage
+
+        # # Verify the model artifact exists
+        # try:
+        #     artifacts = client.list_artifacts(run_id, path="model")
+        #     if not artifacts:
+        #         raise ValueError(f"No model artifacts found at path 'model'")
+        #     print(f"   ✅ Model artifacts verified: {[a.path for a in artifacts]}")
+        # except Exception as e:
+        #     print(f"   ❌ Artifact verification failed: {e}")
+        #     raise
+        
+        # mlflow.set_tag("model_type", "logistic_reg")
+        
+        # run_id = run.info.run_id
+        # run_uuid = run.info.artifact_uri.split('/')[-2]
+
+        # mlflow.sklearn.log_model(model, artifact_path="model", signature=signature)
+        
+        # CRITICAL: Verify model was logged with retry logic (handles S3 sync delay)
+        run_id = run.info.run_id
+        client = MlflowClient()
+        
+        # print(f"   ⏳ Verifying model artifacts for run {run_id}...")
+        # max_retries = 10
+        # artifacts_found = False
+        
+        # for attempt in range(max_retries):
+        #     time.sleep(2)  # Wait before checking
+        #     try:
+        #         artifacts = client.list_artifacts(run_id, path="model")
+        #         if artifacts:
+        #             print(f"   ✅ Model artifacts verified (attempt {attempt + 1}/{max_retries})")
+        #             print(f"      Found: {[a.path for a in artifacts]}")
+        #             artifacts_found = True
+        #             break
+        #     except Exception as e:
+        #         if attempt < max_retries - 1:
+        #             print(f"   ⏳ Waiting for artifacts... (attempt {attempt + 1}/{max_retries})")
+        #         else:
+        #             print(f"   ❌ Verification failed after {max_retries} attempts: {e}")
+        #             raise ValueError(f"Model artifacts not found after {max_retries} attempts")
+        
+        # if not artifacts_found:
+        #     raise ValueError(f"Failed to verify model artifacts for run {run_id}")
         
         mlflow.set_tag("model_type", "logistic_reg")
         
-        run_id = run.info.run_id
         run_uuid = run.info.artifact_uri.split('/')[-2]
         
         print(f"   Logistic_reg F2: {test_metrics['f2_score']:.4f}")
@@ -523,6 +870,10 @@ def train_logistic(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=50):
 def train_lightgbm(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=50):
     print("\n Tuning LightGBM with Optuna...")
     
+    mlflow_callback = MLflowCallback(metric_name='f2_score',
+                                     create_experiment=False,
+                                     mlflow_kwargs={"nested": True})
+    
     study = optuna.create_study(
         direction='maximize',
         study_name='lightgbm_optimization',
@@ -532,23 +883,27 @@ def train_lightgbm(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=50):
     study.optimize(
         create_lightgbm_objective(X_train, y_train, X_val, y_val),
         n_trials=n_trials,
+        callbacks=[mlflow_callback],
         show_progress_bar=True
     )
     
     print(f"   Best F2: {study.best_value:.4f}")
     
     # Train final model with best params
+    if mlflow.active_run():
+        mlflow.end_run()
+        
     with mlflow.start_run(run_name="lightgbm_best") as run:
         best_params = study.best_params.copy()
         best_params.update({
             'class_weight': 'balanced',
             'random_state': RANDOM_STATE,
             'verbose': -1,
-            'n_jobs': -1
+            'n_jobs': 1
         })
         
         model = LGBMClassifier(**best_params)
-        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
         
         # Optimize threshold
         optimal_threshold, _ = optimize_threshold(model, X_val, y_val, beta=2)
@@ -589,17 +944,115 @@ def train_lightgbm(X_train, y_train, X_val, y_val, X_test, y_test, n_trials=50):
         # 3. Log the "Hybrid" Model using pyfunc
         signature = infer_signature(X_train, model.predict_proba(X_train))
         
+        # mlflow.lightgbm.log_model(model,artifact_path="model",signature=signature)
+
         mlflow.pyfunc.log_model(
-            artifact_path="model",
+            name="model",
             python_model=CyberBullyingModelWrapper(), 
             artifacts=artifacts,                 
             signature=signature,
-            pip_requirements=["torch", "transformers", "scikit-learn", "lightgbm"]
+            pip_requirements=["torch", "transformers", "scikit-learn", "lightgbm", "joblib"]
         )
+
+        # print(f"   📦 Logging model to MLflow...")
+        # try:
+        #     mlflow.pyfunc.log_model(
+        #         artifact_path="model",
+        #         python_model=CyberBullyingModelWrapper(), 
+        #         artifacts=artifacts,
+        #         signature=signature,
+        #         pip_requirements=["torch", "transformers", "scikit-learn", "lightgbm", 'joblib']
+        #     )
+        # except Exception as e:
+        #     print(f"   ❌ Model logging failed: {e}")
+        #     import traceback
+        #     traceback.print_exc()
+        #     raise
+        
+        # print(f"   ⏳ Waiting for S3 sync...")
+        # time.sleep(3)  # Give S3 time to sync
+        
+        # # ✅ FIX 3: Verify with client
+        # client = MlflowClient()
+        # run_id = run.info.run_id
+        
+        # # Try multiple times (S3 eventual consistency)
+        # max_retries = 5
+        # for attempt in range(max_retries):
+        #     try:
+        #         artifacts_list = client.list_artifacts(run_id)
+        #         artifact_paths = [a.path for a in artifacts_list]
+                
+        #         if "model" in artifact_paths:
+        #             print(f"   ✅ Model found in MLflow (attempt {attempt + 1})")
+        #             # Verify model subfolder
+        #             model_artifacts = client.list_artifacts(run_id, path="model")
+        #             print(f"   📂 Model contents: {[a.path for a in model_artifacts]}")
+        #             break
+        #         else:
+        #             if attempt < max_retries - 1:
+        #                 print(f"   ⏳ Model not found yet, waiting... (attempt {attempt + 1})")
+        #                 time.sleep(2)
+        #             else:
+        #                 raise ValueError(f"Model not found after {max_retries} attempts! Available: {artifact_paths}")
+        #     except Exception as e:
+        #         if attempt < max_retries - 1:
+        #             print(f"   ⚠️  Verification attempt {attempt + 1} failed: {e}")
+        #             time.sleep(2)
+        #         else:
+        #             raise
+
+        # run_id = run.info.run_id
+        # client = MlflowClient()
+
+        # print(f"   ⏳ Verifying model artifacts for run {run_id}...")
+        # time.sleep(3)  # Give MLflow time to write to storage
+
+        # # Verify the model artifact exists
+        # try:
+        #     artifacts = client.list_artifacts(run_id, path="model")
+        #     if not artifacts:
+        #         raise ValueError(f"No model artifacts found at path 'model'")
+        #     print(f"   ✅ Model artifacts verified: {[a.path for a in artifacts]}")
+        # except Exception as e:
+        #     print(f"   ❌ Artifact verification failed: {e}")
+        #     raise
+        # mlflow.set_tag("model_type", "lightgbm")
+        
+        # run_id = run.info.run_id
+        # run_uuid = run.info.artifact_uri.split('/')[-2]
+
+        # mlflow.lightgbm.log_model(model, artifact_path="model", signature=signature)
+        
+        # CRITICAL: Verify model was logged with retry logic (handles S3 sync delay)
+        run_id = run.info.run_id
+        client = MlflowClient()
+        
+        # print(f"   ⏳ Verifying model artifacts for run {run_id}...")
+        # max_retries = 10
+        # artifacts_found = False
+        
+        # for attempt in range(max_retries):
+        #     time.sleep(2)  # Wait before checking
+        #     try:
+        #         artifacts = client.list_artifacts(run_id, path="model")
+        #         if artifacts:
+        #             print(f"   ✅ Model artifacts verified (attempt {attempt + 1}/{max_retries})")
+        #             print(f"      Found: {[a.path for a in artifacts]}")
+        #             artifacts_found = True
+        #             break
+        #     except Exception as e:
+        #         if attempt < max_retries - 1:
+        #             print(f"   ⏳ Waiting for artifacts... (attempt {attempt + 1}/{max_retries})")
+        #         else:
+        #             print(f"   ❌ Verification failed after {max_retries} attempts: {e}")
+        #             raise ValueError(f"Model artifacts not found after {max_retries} attempts")
+        
+        # if not artifacts_found:
+        #     raise ValueError(f"Failed to verify model artifacts for run {run_id}")
         
         mlflow.set_tag("model_type", "lightgbm")
         
-        run_id = run.info.run_id
         run_uuid = run.info.artifact_uri.split('/')[-2]
         
         print(f"   LightGBM F2: {test_metrics['f2_score']:.4f}")
@@ -625,10 +1078,14 @@ def run_all_experiments(X_train, X_val, X_test, y_train, y_val, y_test, scale_po
         X_train, y_train, X_val, y_val, X_test, y_test, n_trials
     )
     
+    log_run_id, log_uuid, log_f2 = train_logistic(
+        X_train, y_train, X_val, y_val, X_test, y_test, n_trials
+    )
     # Compare results
     results = [
         ("XGBoost", xgb_run_id, xgb_uuid, xgb_f2),
         ("LightGBM", lgb_run_id, lgb_uuid, lgb_f2),
+        ("Logistic_reg", log_run_id, log_uuid, log_f2)
     ]
     
     results.sort(key=lambda x: x[3], reverse=True)
@@ -648,65 +1105,420 @@ def run_all_experiments(X_train, X_val, X_test, y_train, y_val, y_test, scale_po
 # ==========================================
 # MODEL PROMOTION
 # ==========================================
+# @task(log_prints=True)
+# def promote_best_model(winner_id, winner_uuid, winner_f2, winner_name, client):
+#     print("\nPromoting Best Model to Registry...")
+#     # bucket_root = os.getenv("MLFLOW_ARTIFACT_LOCATION", "s3://cyberbullying-artifacts/mlflow")
+#     # model_url = f"{bucket_root}/models/{winner_uuid}/artifacts/model"
+#     print(f"   ⏳ Waiting 60 seconds for DagsHub S3 sync...")
+#     time.sleep(60)
+#     model_url = f"runs:/{winner_id}/model"
+#     try:
+#         prod_models = client.get_latest_versions(name=EXPERIMENT_NAME, stages=["Production"])
+#         if prod_models:
+#             current_prod = prod_models[0]
+#             prod_run = client.get_run(current_prod.run_id)
+#             prod_f2 = prod_run.data.metrics.get('test_f2_score', 0.0)
+#             print(f"   Current Production F2: {prod_f2:.4f}")
+#         else:
+#             prod_f2 = 0.0
+#             print("   No current production model")
+#     except Exception as e:
+#         prod_f2 = 0.0
+#         print(f"   No production model found: {e}")
+    
+#     # Register new model
+#     print(f"   Registering model from: {model_url}")
+#     mv = mlflow.register_model(model_url, name=EXPERIMENT_NAME)
+    
+#     if winner_f2 > prod_f2:
+#         client.transition_model_version_stage(
+#             name=EXPERIMENT_NAME,
+#             version=mv.version,
+#             stage='Production',
+#             archive_existing_versions=True
+#         )
+#         print(f"   ✅ Model v{mv.version} promoted to PRODUCTION")
+#         print(f"   📈 Improvement: {winner_f2 - prod_f2:.4f} (+{((winner_f2 - prod_f2)/prod_f2)*100:.2f}%)")
+        
+#         # Save promotion metadata
+#         promotion_metadata = {
+#             'version': mv.version,
+#             'model_type': winner_name,
+#             'f2_score': float(winner_f2),
+#             'previous_f2': float(prod_f2),
+#             'improvement': float(winner_f2 - prod_f2),
+#             'run_id': winner_id,
+#             'promoted_at': pd.Timestamp.now().isoformat()
+#         }
+        
+#         with open(f"{ARTIFACTS_DIR}/production_model_metadata.json", 'w') as f:
+#             json.dump(promotion_metadata, f, indent=2)
+            
+#     else:
+#         client.transition_model_version_stage(
+#             name=EXPERIMENT_NAME,
+#             version=mv.version,
+#             stage='Archived',
+#             archive_existing_versions=False
+#         )
+#         print(f"   ⚠️  Model v{mv.version} archived (no improvement)")
+#         print(f"   Current production model is still better")
+
+# @task(log_prints=True)
+# def promote_best_model(winner_id, winner_uuid, winner_f2, winner_name, client):
+#     print("\nPromoting Best Model to Registry (Alternative Method)...")
+#     run = client.get_run(winner_id)
+#     artifact_uri = run.info.artifact_uri
+
+#     print(f"   Run ID: {winner_id}")
+#     print(f"   Artifact URI: {artifact_uri}")
+
+#     model_url = f"{artifact_uri}/model"
+#     print(f"   Registering model from: {model_url}")
+
+#     try:
+#         prod_models = client.get_latest_versions(name=EXPERIMENT_NAME, stages=['Production'])
+#         if prod_models:
+#             # print(f"Present prod model")
+#             current_prod = prod_models[0]
+#             prod_run = current_prod.get_run(current_prod.run_id)
+#             prod_f2 = prod_run.data.metrics.get('test_f2_score', 0.0)
+#             print(f"   Current Production F2: {prod_f2:.4f}")
+#         else:
+#              prod_f2 = 0.0
+#              print("   No current production model")
+#     except Exception as e:
+#         prod_f2 = 0.0
+#         print(f"   No production model found: {e}")
+
+#     mv = mlflow.register_model(model_url, name=EXPERIMENT_NAME)
+#     print(f"   Registering model from: {model_url}")
+#     if winner_f2 > prod_f2:
+#         client.transition_model_version_stage(name=EXPERIMENT_NAME, version=mv.version, stage=['Production'], archive_existing_versions=True)
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "model_type", winner_name)
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "f2_score", str(winner_f2))
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "run_id", winner_id)
+#         print(f"   ✅ Model v{mv.version} promoted to PRODUCTION")
+#         print(f"   📈 Improvement: {winner_f2 - prod_f2:.4f} (+{((winner_f2 - prod_f2)/prod_f2)*100:.2f}%)")
+
+
+#         print(f"   Final Model: {winner_name} (F2: {winner_f2:.4f})")
+        
+#     return mv.version
+# @task(log_prints=True)
+# def promote_best_model(winner_id, winner_uuid, winner_f2, winner_name, client):
+#     print("\nPromoting Best Model to Registry (Direct URI Method)...")
+    
+#     # 1. Resolve Direct S3 Path (Bypasses Dagshub's permission blindspot)
+#     run = client.get_run(winner_id)
+#     artifact_uri = run.info.artifact_uri
+#     model_url = f"{artifact_uri}/model"
+    
+#     print(f"   Run ID: {winner_id}")
+#     print(f"   Artifact URI: {artifact_uri}")
+#     print(f"   Registering model from: {model_url}")
+
+#     # 2. Get Current Production Metrics (Safely)
+#     prod_f2 = 0.0
+#     try:
+#         prod_models = client.get_latest_versions(name=EXPERIMENT_NAME, stages=['Production'])
+#         print(prod_models)
+#         if prod_models:
+#             current_prod = prod_models[0]
+#             print(current_prod)
+#             prod_run = client.get_run(current_prod.tags['run_id'])
+#             prod_f2 = prod_run.data.metrics.get('test_f2_score', 0.0)
+#             print(f"   Current Production F2: {prod_f2:.4f}")
+#         else:
+#              print("   No current production model")
+#     except Exception as e:
+#         print(f"   ⚠️ Could not fetch production model info: {e}")
+#         prod_f2 = 0.0
+
+#     # 3. Register the Model
+#     # Note: Since we use the Direct URI, this usually works instantly. 
+#     # But adding a small retry is good safety against S3 latency.
+#     mv = None
+#     try:
+#         mv = mlflow.register_model(model_url, name=EXPERIMENT_NAME)
+#         print(f"   ✅ Registered as version {mv.version}")
+#     except Exception as e:
+#         print(f"   ❌ Registration failed: {e}")
+#         raise e
+
+#     # 4. Compare and Promote
+#     if winner_f2 > prod_f2:
+#         # --- FIX 2: Use String 'Production', not List ---
+#         client.transition_model_version_stage(
+#             name=EXPERIMENT_NAME, 
+#             version=mv.version, 
+#             stage='Production', 
+#             archive_existing_versions=True
+#         )
+        
+#         # Add metadata tags
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "model_type", winner_name)
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "f2_score", str(winner_f2))
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "run_id", winner_id)
+        
+#         # --- FIX 3: Safe Percentage Calculation ---
+#         if prod_f2 > 0:
+#             improvement_pct = ((winner_f2 - prod_f2) / prod_f2) * 100
+#         else:
+#             improvement_pct = 100.0 # Infinite improvement over 0
+            
+#         print(f"   ✅ Model v{mv.version} promoted to PRODUCTION")
+#         print(f"   📈 Improvement: {winner_f2 - prod_f2:.4f} (+{improvement_pct:.2f}%)")
+#         print(f"   Final Model: {winner_name} (F2: {winner_f2:.4f})")
+        
+#     else:
+#         # Archive if it didn't beat production
+#         client.transition_model_version_stage(
+#             name=EXPERIMENT_NAME, 
+#             version=mv.version, 
+#             stage='Archived', 
+#             archive_existing_versions=False
+#         )
+#         print(f"   ⚠️ Model v{mv.version} archived (F2: {winner_f2:.4f} <= Prod: {prod_f2:.4f})")
+        
+#     return mv.version
+
+
+# @task(log_prints=True)
+# def promote_best_model(winner_id, winner_uuid, winner_f2, winner_name, client):
+#     """
+#     Alternative approach: Register model directly from artifact URI
+#     """
+#     print("\nPromoting Best Model to Registry (Alternative Method)...")
+    
+#     try:
+#         # Get the run to access artifact URI
+#         run = client.get_run(winner_id)
+#         artifact_uri = run.info.artifact_uri
+        
+#         print(f"   Run ID: {winner_id}")
+#         print(f"   Artifact URI: {artifact_uri}")
+        
+#         # Construct full model path
+#         model_path = f"{artifact_uri}/model"
+        
+#         print(f"   Registering model from: {model_path}")
+        
+#         # Register using full artifact path
+#         mv = mlflow.register_model(model_path, name=EXPERIMENT_NAME)
+        
+#         print(f"   ✅ Registered as {EXPERIMENT_NAME} v{mv.version}")
+        
+#         # Add tags
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "model_type", winner_name)
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "f2_score", str(winner_f2))
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "run_id", winner_id)
+        
+#         print(f"   Final Model: {winner_name} (F2: {winner_f2:.4f})")
+        
+#         return mv.version
+        
+#     except Exception as e:
+#         print(f"   ❌ Error: {e}")
+#         raise
+
+
+# @task(log_prints=True)
+# def promote_best_model(winner_id, winner_uuid, winner_f2, winner_name, client):
+#     print("\nPromoting Best Model to Registry (CORRECT METHOD)...")
+
+#     model_uri = f"runs:/{winner_id}/model"
+#     print(f"   Registering from: {model_uri}")
+
+#     # 1. Fetch current production model (STRICT)
+#     prod_f2 = 0.0
+#     # prod_versions = client.search_model_versions(
+#     #     f"name='{EXPERIMENT_NAME}' and current_stage='Production'"
+#     # )
+#     all_versions = client.search_model_versions(f"name='{EXPERIMENT_NAME}'")
+
+#     # 2. Filter for 'Production' using Python
+#     prod_versions = [v for v in all_versions if v.current_stage == "Production"]
+
+#     if prod_versions:
+#         prod = prod_versions[0]
+
+#         if not prod.run_id:
+#             print("⚠️ Existing Production model has NO run_id → ignoring it")
+#             prod_f2 = 0.0
+#         else:
+#             prod_run = client.get_run(prod.run_id)
+#             prod_f2 = prod_run.data.metrics.get("test_f2_score", 0.0)
+#             print(f"   Current Production F2: {prod_f2:.4f}")
+#     else:
+#         print("   No Production model found")
+
+#     # 2. Register new model (THIS preserves lineage)
+#     mv = mlflow.register_model(model_uri, EXPERIMENT_NAME)
+#     print(f"   Registered as version {mv.version}")
+
+#     # 3. Compare & promote
+#     if winner_f2 > prod_f2:
+#         client.transition_model_version_stage(
+#             name=EXPERIMENT_NAME,
+#             version=mv.version,
+#             stage="Production",
+#             archive_existing_versions=True
+#         )
+
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "model_type", winner_name)
+
+#         print(f"   ✅ PROMOTED → Production (F2={winner_f2:.4f})")
+#     else:
+#         client.transition_model_version_stage(
+#             name=EXPERIMENT_NAME,
+#             version=mv.version,
+#             stage="Archived"
+#         )
+
+#         print(f"   ⚠️ Archived (F2={winner_f2:.4f} <= {prod_f2:.4f})")
+
+#     return mv.version
+# # model_url = f"mlflow-artifacts:/@/{run_id}/artifacts/model"
+
+
+# @task(log_prints=True)
+# def promote_best_model(winner_id, winner_uuid, winner_f2, winner_name, client):
+#     print("\nPromoting Best Model to Registry...")
+    
+#     model_uri = f"runs:/{winner_id}/model"
+#     print(f"   Registering from: {model_uri}")
+    
+#     # Wait for S3 sync (DagsHub/remote storage can be slow)
+#     print(f"   ⏳ Waiting for storage sync...")
+#     time.sleep(5)
+    
+#     # Verify the model exists before trying to register
+#     max_retries = 5
+#     for attempt in range(max_retries):
+#         try:
+#             artifacts = client.list_artifacts(winner_id, path="model")
+#             if artifacts:
+#                 print(f"   ✅ Model artifacts found (attempt {attempt + 1})")
+#                 break
+#         except Exception as e:
+#             if attempt < max_retries - 1:
+#                 print(f"   ⏳ Waiting for artifacts... (attempt {attempt + 1})")
+#                 time.sleep(5)
+#             else:
+#                 raise ValueError(f"Model artifacts not found after {max_retries} attempts: {e}")
+    
+#     # Now register the model
+#     prod_f2 = 0.0
+#     # prod_versions = client.search_model_versions(
+#     #     f"name='{EXPERIMENT_NAME}' and current_stage='Production'"
+#     # )
+#     all_versions = client.search_model_versions(f"name='{EXPERIMENT_NAME}'")
+
+# #     # 2. Filter for 'Production' using Python
+#     prod_versions = [v for v in all_versions if v.current_stage == "Production"]
+    
+#     if prod_versions:
+#         prod = prod_versions[0]
+#         if prod.run_id:
+#             prod_run = client.get_run(prod.run_id)
+#             prod_f2 = prod_run.data.metrics.get("test_f2_score", 0.0)
+#             print(f"   Current Production F2: {prod_f2:.4f}")
+#         else:
+#             print("   ⚠️ Existing Production model has NO run_id → ignoring it")
+#     else:
+#         print("   No Production model found")
+    
+#     # Register new model
+#     mv = mlflow.register_model(model_uri, EXPERIMENT_NAME)
+#     print(f"   ✅ Registered as version {mv.version}")
+    
+#     # Compare & promote
+#     if winner_f2 > prod_f2:
+#         client.transition_model_version_stage(
+#             name=EXPERIMENT_NAME,
+#             version=mv.version,
+#             stage="Production",
+#             archive_existing_versions=True
+#         )
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "model_type", winner_name)
+#         client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "f2_score", str(winner_f2))
+        
+#         improvement = winner_f2 - prod_f2
+#         pct_improvement = (improvement / prod_f2 * 100) if prod_f2 > 0 else float('inf')
+#         print(f"   ✅ PROMOTED → Production (F2={winner_f2:.4f}, +{improvement:.4f} / +{pct_improvement:.1f}%)")
+#     else:
+#         client.transition_model_version_stage(
+#             name=EXPERIMENT_NAME,
+#             version=mv.version,
+#             stage="Archived"
+#         )
+#         print(f"   ⚠️ Archived (F2={winner_f2:.4f} <= {prod_f2:.4f})")
+    
+#     return mv.version
+
+
 @task(log_prints=True)
 def promote_best_model(winner_id, winner_uuid, winner_f2, winner_name, client):
-    """Promote best model to production if it beats current champion"""
-    print("\n📦 Promoting Best Model to Registry...")
+    print("\nPromoting Best Model to Registry (Robust Method)...")
     
+    # 1. Get the Staging Area Path (Run Artifacts)
+    run = client.get_run(winner_id)
+    artifact_uri = run.info.artifact_uri
+    model_url = f"{artifact_uri}/model"
+    # model_url=f"runs:/{winner_id}/model"
+    # print(f"model url used: {model_url}")
+    # print(f"model url that's supposed to be used: {f"runs:/{winner_id}/model"}")
     
-    bucket_root = os.getenv("MLFLOW_ARTIFACT_LOCATION", "s3://cyberbullying-artifacts/mlflow")
-    model_url = f"{bucket_root}/models/{winner_uuid}/artifacts/model"
-    
-    # Check current production model
+    print(f"   Run ID: {winner_id}")
+    print(f"   Looking for model in Staging Area: {model_url}")
+
+    # 2. Get Current Production Metrics (Safely)
+    prod_f2 = 0.0
     try:
-        prod_models = client.get_latest_versions(name=EXPERIMENT_NAME, stages=["Production"])
+        # Note: mlflow < 2.9.0 uses get_latest_versions
+        prod_models = client.get_latest_versions(name=EXPERIMENT_NAME, stages=['Production'])
         if prod_models:
             current_prod = prod_models[0]
-            prod_run = client.get_run(current_prod.run_id)
-            prod_f2 = prod_run.data.metrics.get('test_f2_score', 0.0)
-            print(f"   Current Production F2: {prod_f2:.4f}")
-        else:
-            prod_f2 = 0.0
-            print("   No current production model")
+            if current_prod.run_id:
+                prod_run = client.get_run(current_prod.run_id)
+                prod_f2 = prod_run.data.metrics.get('test_f2_score', 0.0)
+                print(f"   Current Production F2: {prod_f2:.4f}")
+            else:
+                print("   ⚠️ Production model has missing run_id. Ignoring.")
     except Exception as e:
-        prod_f2 = 0.0
-        print(f"   No production model found: {e}")
-    
-    # Register new model
-    print(f"   Registering model from: {model_url}")
+        print(f"   ⚠️ Could not fetch production metrics: {e}")
+
+    # 3. VERIFY & REGISTER (The Fix)
+    # We loop until the model appears in the Staging Area
+    mv = None
+    max_retries = 12 # Wait up to 2 minutes
     mv = mlflow.register_model(model_url, name=EXPERIMENT_NAME)
-    
+
+    # 4. Promote
     if winner_f2 > prod_f2:
         client.transition_model_version_stage(
-            name=EXPERIMENT_NAME,
-            version=mv.version,
-            stage='Production',
-            archive_existing_versions=True
+            name=EXPERIMENT_NAME, version=mv.version, stage='Production', archive_existing_versions=True
         )
-        print(f"   ✅ Model v{mv.version} promoted to PRODUCTION")
-        print(f"   📈 Improvement: {winner_f2 - prod_f2:.4f} (+{((winner_f2 - prod_f2)/prod_f2)*100:.2f}%)")
         
-        # Save promotion metadata
-        promotion_metadata = {
-            'version': mv.version,
-            'model_type': winner_name,
-            'f2_score': float(winner_f2),
-            'previous_f2': float(prod_f2),
-            'improvement': float(winner_f2 - prod_f2),
-            'run_id': winner_id,
-            'promoted_at': pd.Timestamp.now().isoformat()
-        }
+        # Add Tags
+        client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "model_type", winner_name)
+        client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "f2_score", str(winner_f2))
+        client.set_model_version_tag(EXPERIMENT_NAME, mv.version, "run_id", winner_id)
         
-        with open(f"{ARTIFACTS_DIR}/production_model_metadata.json", 'w') as f:
-            json.dump(promotion_metadata, f, indent=2)
+        # Calculate Improvement
+        if prod_f2 > 0:
+            imp = ((winner_f2 - prod_f2)/prod_f2)*100
+        else:
+            imp = 100.0
             
+        print(f"   ✅ Promoted v{mv.version} to Production (+{imp:.2f}%)")
+        print(f"   Final Model: {winner_name} (F2: {winner_f2:.4f})")
     else:
         client.transition_model_version_stage(
-            name=EXPERIMENT_NAME,
-            version=mv.version,
-            stage='Archived',
-            archive_existing_versions=False
+            name=EXPERIMENT_NAME, version=mv.version, stage='Archived', archive_existing_versions=False
         )
-        print(f"   ⚠️  Model v{mv.version} archived (no improvement)")
-        print(f"   Current production model is still better")
+        print(f"   ⚠️ Archived v{mv.version} (Did not beat production)")
 
+    return mv.version

@@ -10,6 +10,7 @@ data/*.json
 data/*.parquet
 data/*.db
 
+
 # IDE
 .vscode/
 .idea/
@@ -18,3 +19,7 @@ data/*.db
 *.pkl
 *.h5
 *.pt
+
+.csv
+
+artifacts/
