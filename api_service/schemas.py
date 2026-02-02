@@ -6,8 +6,6 @@ class PredictionRequest(BaseModel):
     text: str = Field(..., example="You are trash at this game", min_length=1)
     user_id: str = Field(..., example="123456789")
     
-    # Context Features (Sent by Bot)
-    # We set defaults so the API doesn't crash if the bot forgets one
     msg_len: int = Field(0, description="Length of message")
     caps_ratio: float = Field(0.0, description="Ratio of uppercase letters")
     personal_pronoun_count: int = Field(0, description="Count of you/your")

@@ -1,1 +1,60 @@
-# docker-compose.yml - Created for Cyberbullying Bot Project
+version: '3.8'
+
+services:
+  redis:
+    image: redis:alpha
+    container_name: bully-redis
+    ports:
+      - "6379:6379"
+    restart: always
+
+  api:
+    build:
+      context: .
+      dockerfile: api_service/Dockerfile
+    container_name: bully-api
+    ports:
+      - "8000:8000"
+    environment:
+      - MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI}
+      - REDIS_HOST=redis  
+      - REDIS_PORT=6379
+      - MODEL_STAGE=Production
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    depends_on:
+      - redis
+
+  bot:
+    build:
+      context: .
+      dockerfile: bot/Dockerfile
+    container_name: bully-bot
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - API_BASE_URL=http://api:8000
+    depends_on:
+      - api
+    restart: always
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: bully-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    depends_on:
+      - api
+    restart: always
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: bully-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+    restart: always

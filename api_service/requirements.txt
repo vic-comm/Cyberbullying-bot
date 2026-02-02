@@ -1,1 +1,15 @@
 # requirements.txt - Created for Cyberbullying Bot Project
+fastapi
+uvicorn
+mlflow==2.22.4
+pandas
+numpy
+torch
+transformers
+scikit-learn
+xgboost
+lightgbm
+boto3
+pydantic
+redis
+prometheus-client

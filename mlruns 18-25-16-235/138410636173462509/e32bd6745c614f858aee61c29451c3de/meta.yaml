@@ -1,0 +1,15 @@
+artifact_uri: s3://cyberbullying-artifacts-victor-obi/mlflow/e32bd6745c614f858aee61c29451c3de/artifacts
+end_time: 1770037570614
+entry_point_name: ''
+experiment_id: '138410636173462509'
+lifecycle_stage: active
+run_id: e32bd6745c614f858aee61c29451c3de
+run_name: xgboost_best
+run_uuid: e32bd6745c614f858aee61c29451c3de
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1770037535015
+status: 4
+tags: []
+user_id: chidera

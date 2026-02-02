@@ -1,117 +1,413 @@
-# app.py - Created for Cyberbullying Bot Project
 import time
 import json
 import os
-import mlflow.pyfunc
-import pandas as pd
-from fastapi import FastAPI, HTTPException
+import logging
+from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-# Import schemas
+import mlflow.pyfunc
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST
+from starlette.responses import Response
+from mlflow.tracking import MlflowClient
+
+from mlops.feature_store import FeatureStore
 from schemas import PredictionRequest, PredictionResponse
 
-# Configuration
+
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-EXPERIMENT_NAME = "cyberbullying-detection"
-LOGS_PATH = "../data/raw_logs.jsonl"
+EXPERIMENT_NAME = os.getenv("MODEL_NAME", "cyberbullying-detection")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+LOGS_PATH = os.getenv("LOGS_PATH", "../data/raw_logs.jsonl")
+STAGE = os.getenv("MODEL_STAGE", "Production")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# Global Model Variable
-model = None
-model_meta = {"version": "unknown"}
 
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('../logs/api.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# PROMETHEUS METRICS
+# Track request counts by endpoint and status
+REQUEST_COUNT = Counter(
+    'api_requests_total',
+    'Total API requests',
+    ['method', 'endpoint', 'status']
+)
+
+# Track prediction latency
+PREDICTION_LATENCY = Histogram(
+    'prediction_duration_seconds',
+    'Time spent processing prediction',
+    buckets=[0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5]
+)
+
+# Track toxicity predictions
+TOXICITY_PREDICTIONS = Counter(
+    'toxicity_predictions_total',
+    'Total toxicity predictions',
+    ['result']  
+)
+
+MODEL_VERSION = Gauge(
+    'model_version_info',
+    'Current model version in production',
+    ['version']
+)
+
+# Track feature store latency
+FEATURE_STORE_LATENCY = Histogram(
+    'feature_store_duration_seconds',
+    'Time spent fetching features from Redis'
+)
+
+
+# GLOBAL STATE
+model: Optional[mlflow.pyfunc.PyFuncModel] = None
+model_meta: Dict[str, Any] = {
+    "version": "unknown",
+    "loaded_at": None,
+    "stage": STAGE
+}
+fs: Optional[FeatureStore] = None
+
+# LIFESPAN MANAGEMENT
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Load the Production Model on Startup.
-    This prevents loading it for every single request (which would be slow).
+    Manage application startup and shutdown.
+    - Loads model from MLflow on startup
+    - Initializes feature store connection
+    - Handles graceful shutdown
     """
-    global model, model_meta
+    global model, model_meta, fs
     
-    print("🚀 API Starting... Connecting to MLflow...")
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    logger.info(" Starting Cyberbullying Detection API...")
+    logger.info(f"MLflow URI: {MLFLOW_TRACKING_URI}")
+    logger.info(f"Model: {EXPERIMENT_NAME} (Stage: {STAGE})")
     
+    # Initialize Feature Store
     try:
-        # Load the specific model tagged as "Production"
-        model_uri = f"models:/{EXPERIMENT_NAME}/Production"
+        fs = FeatureStore(redis_host=REDIS_HOST, redis_port=REDIS_PORT)
+        logger.info(f" Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+    except Exception as e:
+        logger.error(f" Failed to connect to Redis: {e}")
+        logger.warning("  API will start but feature enrichment will fail")
+    
+    # Load Model from MLflow
+    try:
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        model_uri = f"models:/{EXPERIMENT_NAME}/{STAGE}"
+        
+        logger.info(f"Loading model from: {model_uri}")
         model = mlflow.pyfunc.load_model(model_uri)
         
-        # Get version info
-        client = mlflow.tracking.MlflowClient()
-        versions = client.get_latest_versions(EXPERIMENT_NAME, stages=["Production"])
-        if versions:
-            model_meta["version"] = versions[0].version
-            
-        print(f"✅ Production Model v{model_meta['version']} Loaded Successfully!")
+        # Fetch model metadata
+        client = MlflowClient()
+        versions = client.get_latest_versions(EXPERIMENT_NAME, stages=[STAGE])
         
+        if versions:
+            model_version = versions[0].version
+            model_meta.update({
+                "version": model_version,
+                "loaded_at": datetime.now().isoformat(),
+                "run_id": versions[0].run_id
+            })
+            
+            # Update Prometheus metric
+            MODEL_VERSION.labels(version=model_version).set(1)
+            
+            logger.info(f" Model v{model_version} loaded successfully!")
+        else:
+            logger.warning(f"  No model found in '{STAGE}' stage")
+            
     except Exception as e:
-        print(f"❌ FAILED to load model: {e}")
-        print("⚠️  Server will start, but predictions will fail until fixed.")
+        logger.error(f" Failed to load model: {e}", exc_info=True)
+        logger.warning("  Server starting without model - predictions will fail")
+    
+    # Ensure logs directory exists
+    os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
     
     yield
-    print("🛑 API Shutting Down...")
+    
+    # Shutdown
+    logger.info("🛑 Shutting down API...")
+    if fs and fs.redis:
+        fs.redis.close()
+        logger.info("Closed Redis connection")
 
-# Initialize App
-app = FastAPI(title="Cyberbullying Detection API", version="1.0", lifespan=lifespan)
+# FASTAPI APP INITIALIZATION
+app = FastAPI(
+    title="Cyberbullying Detection API",
+    description="Real-time toxicity detection with MLflow model serving",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# MIDDLEWARE
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming requests and track metrics"""
+    start_time = time.time()
+    
+    response = await call_next(request)
+    
+    process_time = time.time() - start_time
+    
+    REQUEST_COUNT.labels(
+        method=request.method,
+        endpoint=request.url.path,
+        status=response.status_code
+    ).inc()
+    
+    logger.info(
+        f"{request.method} {request.url.path} "
+        f"- Status: {response.status_code} "
+        f"- Duration: {process_time:.3f}s"
+    )
+    
+    return response
+
+# EXCEPTION HANDLERS
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "Internal server error",
+            "detail": str(exc) if os.getenv("DEBUG") else "An unexpected error occurred"
+        }
+    )
+
+# API ENDPOINTS
+@app.get("/")
+def root():
+    return {
+        "service": "Cyberbullying Detection API",
+        "version": "1.0.0",
+        "status": "operational",
+        "endpoints": {
+            "health": "/health",
+            "metrics": "/metrics",
+            "predict": "/predict"
+        }
+    }
 
 @app.get("/health")
 def health_check():
-    """Simple check to see if API is alive"""
-    return {"status": "healthy", "model_loaded": model is not None, "version": model_meta["version"]}
+    health_status = {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "model": {
+            "loaded": model is not None,
+            "version": model_meta.get("version", "unknown"),
+            "stage": model_meta.get("stage", "unknown"),
+            "loaded_at": model_meta.get("loaded_at")
+        },
+        "dependencies": {
+            "redis": "unknown",
+            "mlflow": "unknown"
+        }
+    }
+    
+    if fs:
+        try:
+            fs.redis.ping()
+            health_status["dependencies"]["redis"] = "healthy"
+        except Exception as e:
+            health_status["dependencies"]["redis"] = f"unhealthy: {str(e)}"
+            health_status["status"] = "degraded"
+    
+    try:
+        client = MlflowClient()
+        client.get_experiment_by_name(EXPERIMENT_NAME)
+        health_status["dependencies"]["mlflow"] = "healthy"
+    except Exception as e:
+        health_status["dependencies"]["mlflow"] = f"unhealthy: {str(e)}"
+        health_status["status"] = "degraded"
+    
+    # Overall health
+    if model is None:
+        health_status["status"] = "unhealthy"
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=health_status
+        )
+    
+    return health_status
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus metrics endpoint"""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict(request: PredictionRequest):
-    """
-    Main Inference Endpoint
-    """
     if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-        
-    start_time = time.time()
+        logger.error("Prediction attempted but model not loaded")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Model not loaded. Service unavailable."
+        )
+    
+    request_start = time.time()
     
     try:
-        # 1. Convert Request to DataFrame
-        # The wrapper expects a DataFrame with specific columns
-        input_data = pd.DataFrame([request.model_dump()])
+        input_dict = request.model_dump()
         
-        # 2. Predict
-        # The Custom Wrapper handles SVD, Scaling, and Threshold internally!
-        prediction = model.predict(input_data)[0] # Returns 0 or 1
+        # 2. Enrich with user features from Feature Store (if available)
+        if fs and request.user_id:
+            feature_start = time.time()
+            try:
+                user_features = fs.get_online_features(
+                    feature_group_name="user_toxicity",
+                    entity_id=request.user_id,
+                    version="prod"
+                )
+                if user_features:
+                    input_dict.update(user_features)
+                    logger.debug(f"Enriched with features for user {request.user_id}")
+                
+                FEATURE_STORE_LATENCY.observe(time.time() - feature_start)
+            except Exception as e:
+                logger.warning(f"Feature enrichment failed: {e}")
         
-        # (Optional) If your wrapper supports predict_proba, use that for confidence
-        # For now, we mock confidence or you can update wrapper to return it
-        confidence = 0.95 if prediction == 1 else 0.99 
+        # 3. Convert to DataFrame
+        input_df = pd.DataFrame([input_dict])
         
-        # 3. Log for Feedback Loop
+        # 4. Run prediction
+        prediction_start = time.time()
+        prediction, confidence = model.predict(input_df)
+        prediction_time = time.time() - prediction_start
+        
+        # Convert to Python native types
+        is_toxic = bool(prediction)
+        confidence_score = float(confidence)
+        
+        # 5. Track metrics
+        PREDICTION_LATENCY.observe(prediction_time)
+        TOXICITY_PREDICTIONS.labels(
+            result="toxic" if is_toxic else "non_toxic"
+        ).inc()
+        
+        # 6. Log prediction for monitoring/retraining
         log_entry = {
             "timestamp": datetime.now().isoformat(),
             "user_id": request.user_id,
-            "text": request.text,
+            "text": request.text[:250] + "..." if len(request.text) > 250 else request.text,  # Truncate for privacy
             "prediction": int(prediction),
+            "confidence": confidence_score,
             "model_version": model_meta["version"],
-            # Log inputs so we can retrain later
-            "features": request.model_dump()
+            "processing_time_ms": round((time.time() - request_start) * 1000, 2),
+            "features_enriched": bool(fs and request.user_id)
         }
         
-        # Append to logs file (Thread-safe enough for low volume)
-        with open(LOGS_PATH, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-            
-        # 4. Return Response
-        processing_time = (time.time() - start_time) * 1000
+        # Async logging (could be improved with async queue)
+        try:
+            with open(LOGS_PATH, "a") as f:
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to write log: {e}")
         
-        return {
-            "is_toxic": bool(prediction),
-            "confidence": confidence,
-            "model_version": model_meta["version"],
-            "processing_time_ms": round(processing_time, 2)
-        }
+        # 7. Build response
+        total_time = (time.time() - request_start) * 1000
+        
+        return PredictionResponse(
+            is_toxic=is_toxic,
+            confidence=confidence_score,
+            model_version=model_meta["version"],
+            processing_time_ms=round(total_time, 2)
+        )
         
     except Exception as e:
-        print(f"Prediction Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Prediction failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Prediction failed: {str(e)}"
+        )
+
+@app.post("/reload-model")
+def reload_model():
+    """
+    Hot-reload the production model without restarting the server.
+    Useful for zero-downtime deployments.
+    
+    Note: In production, this should be protected with authentication.
+    """
+    global model, model_meta
+    
+    logger.info("Model reload requested...")
+    
+    try:
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        model_uri = f"models:/{EXPERIMENT_NAME}/{STAGE}"
+        
+        # Load new model
+        new_model = mlflow.pyfunc.load_model(model_uri)
+        
+        # Get metadata
+        client = MlflowClient()
+        versions = client.get_latest_versions(EXPERIMENT_NAME, stages=[STAGE])
+        
+        if versions:
+            new_version = versions[0].version
+            
+            old_version = model_meta.get("version", "unknown")
+            model = new_model
+            model_meta.update({
+                "version": new_version,
+                "loaded_at": datetime.now().isoformat(),
+                "run_id": versions[0].run_id
+            })
+            
+            MODEL_VERSION.labels(version=new_version).set(1)
+            
+            logger.info(f" Model reloaded: v{old_version} → v{new_version}")
+            
+            return {
+                "status": "success",
+                "old_version": old_version,
+                "new_version": new_version,
+                "reloaded_at": model_meta["loaded_at"]
+            }
+        else:
+            raise ValueError(f"No model found in '{STAGE}' stage")
+            
+    except Exception as e:
+        logger.error(f"Model reload failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Model reload failed: {str(e)}"
+        )
 
 if __name__ == "__main__":
     import uvicorn
-    # Run locally for debugging
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        log_level=LOG_LEVEL.lower(),
+        access_log=True
+    )

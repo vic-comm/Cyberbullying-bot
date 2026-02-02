@@ -1,0 +1,14 @@
+aliases: []
+creation_timestamp: 1770039447500
+current_stage: Archived
+description: null
+last_updated_timestamp: 1770042240502
+name: cyberbullying-detection
+run_id: bd7efefe805d498eb4350cb33991a6aa
+run_link: null
+source: s3://cyberbullying-artifacts-victor-obi/mlflow/bd7efefe805d498eb4350cb33991a6aa/artifacts/model
+status: READY
+status_message: null
+storage_location: s3://cyberbullying-artifacts-victor-obi/mlflow/bd7efefe805d498eb4350cb33991a6aa/artifacts/model
+user_id: null
+version: 1
