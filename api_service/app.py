@@ -17,11 +17,19 @@ from starlette.responses import Response
 from mlflow.tracking import MlflowClient
 
 from mlops.feature_store import FeatureStore
-from schemas import PredictionRequest, PredictionResponse
+from mlops.utils import calculate_text_features
+from api_service.schemas import PredictionRequest, PredictionResponse
+from pathlib import Path
+from dotenv import load_dotenv
 
+load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent.parent
+LOGS_DIR = BASE_DIR / "logs"
+LOG_FILE = LOGS_DIR / "api.log"
 
+LOGS_DIR.mkdir(exist_ok=True)
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
-EXPERIMENT_NAME = os.getenv("MODEL_NAME", "cyberbullying-detection")
+EXPERIMENT_NAME = os.getenv("EXPERIMENT_NAME", "cyberbullying-detection")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 LOGS_PATH = os.getenv("LOGS_PATH", "../data/raw_logs.jsonl")
@@ -34,7 +42,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('../logs/api.log')
+        logging.FileHandler(LOG_FILE)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -83,59 +91,152 @@ model_meta: Dict[str, Any] = {
 }
 fs: Optional[FeatureStore] = None
 
+MODEL_TABULAR_FEATURES = [
+    'msg_len', 
+    'caps_ratio', 
+    'personal_pronoun_count', 
+    'slur_count',
+    'user_bad_ratio_7d', 
+    'user_toxicity_trend',
+    'channel_toxicity_ratio', 
+    'hours_since_last_msg', 
+    'is_new_to_channel'
+]
+
+MODEL_INT_FEATURES = [
+    'msg_len', 
+    'personal_pronoun_count', 
+    'slur_count', 
+    'is_new_to_channel'
+]
+
 # LIFESPAN MANAGEMENT
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     """
+#     Manage application startup and shutdown.
+#     - Loads model from MLflow on startup
+#     - Initializes feature store connection
+#     - Handles graceful shutdown
+#     """
+#     global model, model_meta, fs
+    
+#     logger.info(" Starting Cyberbullying Detection API...")
+#     logger.info(f"MLflow URI: {MLFLOW_TRACKING_URI}")
+#     logger.info(f"Model: {EXPERIMENT_NAME} (Stage: {STAGE})")
+    
+#     # Initialize Feature Store
+#     try:
+#         fs = FeatureStore(redis_host=REDIS_HOST, redis_port=REDIS_PORT)
+#         logger.info(f" Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+#     except Exception as e:
+#         logger.error(f" Failed to connect to Redis: {e}")
+#         logger.warning("  API will start but feature enrichment will fail")
+    
+#     # Load Model from MLflow
+#     try:
+#         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+#         model_uri = f"models:/{EXPERIMENT_NAME}/{STAGE}"
+        
+#         logger.info(f"Loading model from: {model_uri}")
+#         model = mlflow.pyfunc.load_model(model_uri)
+        
+#         # Fetch model metadata
+#         client = MlflowClient()
+#         versions = client.get_latest_versions(EXPERIMENT_NAME, stages=[STAGE])
+        
+#         if versions:
+#             model_version = versions[0].version
+#             model_meta.update({
+#                 "version": model_version,
+#                 "loaded_at": datetime.now().isoformat(),
+#                 "run_id": versions[0].run_id
+#             })
+            
+#             # Update Prometheus metric
+#             MODEL_VERSION.labels(version=model_version).set(1)
+            
+#             logger.info(f" Model v{model_version} loaded successfully!")
+#         else:
+#             logger.warning(f"  No model found in '{STAGE}' stage")
+            
+#     except Exception as e:
+#         logger.error(f" Failed to load model: {e}", exc_info=True)
+#         logger.warning("  Server starting without model - predictions will fail")
+    
+#     # Ensure logs directory exists
+#     os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
+    
+#     yield
+    
+#     # Shutdown
+#     logger.info("🛑 Shutting down API...")
+#     if fs and fs.redis:
+#         fs.redis.close()
+#         logger.info("Closed Redis connection")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     Manage application startup and shutdown.
-    - Loads model from MLflow on startup
-    - Initializes feature store connection
-    - Handles graceful shutdown
+    - PRIORITIZES local 'baked' model (Production safe)
+    - Fallback to MLflow Registry (Dev convenience)
+    - Initializes feature store
     """
     global model, model_meta, fs
     
-    logger.info(" Starting Cyberbullying Detection API...")
-    logger.info(f"MLflow URI: {MLFLOW_TRACKING_URI}")
-    logger.info(f"Model: {EXPERIMENT_NAME} (Stage: {STAGE})")
+    logger.info("🚀 Starting Cyberbullying Detection API...")
     
-    # Initialize Feature Store
+    # 1. Initialize Feature Store
     try:
         fs = FeatureStore(redis_host=REDIS_HOST, redis_port=REDIS_PORT)
-        logger.info(f" Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+        logger.info(f"✅ Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
     except Exception as e:
-        logger.error(f" Failed to connect to Redis: {e}")
-        logger.warning("  API will start but feature enrichment will fail")
+        logger.error(f"❌ Failed to connect to Redis: {e}")
+        logger.warning("⚠️ API will start but feature enrichment will fail")
     
-    # Load Model from MLflow
+    # 2. Load Model (The Critical Fix)
     try:
-        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-        model_uri = f"models:/{EXPERIMENT_NAME}/{STAGE}"
+        # Check for baked-in model first (Production Path)
+        local_path = os.getenv("MODEL_LOCAL_PATH", "/app/baked_model")
         
-        logger.info(f"Loading model from: {model_uri}")
-        model = mlflow.pyfunc.load_model(model_uri)
-        
-        # Fetch model metadata
-        client = MlflowClient()
-        versions = client.get_latest_versions(EXPERIMENT_NAME, stages=[STAGE])
-        
-        if versions:
-            model_version = versions[0].version
+        if os.path.exists(local_path):
+            logger.info(f"📂 Found BAKED model at: {local_path}")
+            model = mlflow.pyfunc.load_model(local_path)
+            
             model_meta.update({
-                "version": model_version,
+                "version": "baked-in-prod",
                 "loaded_at": datetime.now().isoformat(),
-                "run_id": versions[0].run_id
+                "source": "local_container"
             })
+            logger.info("✅ Loaded model from local container (Offline Mode)")
             
-            # Update Prometheus metric
-            MODEL_VERSION.labels(version=model_version).set(1)
-            
-            logger.info(f" Model v{model_version} loaded successfully!")
         else:
-            logger.warning(f"  No model found in '{STAGE}' stage")
+            # Fallback to Internet Download (Dev Mode)
+            logger.warning(f"⚠️ No local model found at {local_path}. Attempting remote download...")
             
+            mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+            model_uri = f"models:/{EXPERIMENT_NAME}/{STAGE}"
+            
+            logger.info(f"☁️ Loading from MLflow: {model_uri}")
+            model = mlflow.pyfunc.load_model(model_uri)
+            
+            # Try to fetch version info (Might fail if offline)
+            try:
+                client = MlflowClient()
+                versions = client.get_latest_versions(EXPERIMENT_NAME, stages=[STAGE])
+                if versions:
+                    model_meta["version"] = versions[0].version
+            except Exception:
+                model_meta["version"] = "remote-unknown"
+
+            logger.info(f"✅ Loaded model from MLflow Registry")
+
     except Exception as e:
-        logger.error(f" Failed to load model: {e}", exc_info=True)
-        logger.warning("  Server starting without model - predictions will fail")
+        logger.error(f"❌ CRITICAL: Failed to load model: {e}", exc_info=True)
+        # We generally want the app to crash if the model is missing, 
+        # otherwise Kubernetes/Docker thinks it's healthy when it's useless.
+        # But for debugging, we let it run.
     
     # Ensure logs directory exists
     os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
@@ -146,7 +247,7 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 Shutting down API...")
     if fs and fs.redis:
         fs.redis.close()
-        logger.info("Closed Redis connection")
+        logger.info("👋 Closed Redis connection")
 
 # FASTAPI APP INITIALIZATION
 app = FastAPI(
@@ -275,7 +376,19 @@ def predict(request: PredictionRequest):
     
     try:
         input_dict = request.model_dump()
+        static_features = calculate_text_features(request.text)
+        input_dict.update(static_features)
         
+        # 3. Enrich from Redis (Returns ~5 features)
+        # We initialize defaults first in case Redis is down or user is new
+        redis_defaults = {
+            'user_bad_ratio_7d': 0.0,
+            'user_toxicity_trend': 0.0,
+            'channel_toxicity_ratio': 0.0,
+            'hours_since_last_msg': 24.0, # Default to "been a while"
+            'is_new_to_channel': 1        # Default to "new user"
+        }
+        input_dict.update(redis_defaults)
         # 2. Enrich with user features from Feature Store (if available)
         if fs and request.user_id:
             feature_start = time.time()
@@ -292,20 +405,34 @@ def predict(request: PredictionRequest):
                 FEATURE_STORE_LATENCY.observe(time.time() - feature_start)
             except Exception as e:
                 logger.warning(f"Feature enrichment failed: {e}")
+        final_input = { 'text': [request.text] }
+        for feature in MODEL_TABULAR_FEATURES:
+            raw_val = input_dict.get(feature, 0)
+            final_input[feature] = [raw_val] # Just put the value in, we cast later
+            
+        input_df = pd.DataFrame(final_input)
         
-        # 3. Convert to DataFrame
-        input_df = pd.DataFrame([input_dict])
+        # --- THE FIX: FORCE PANDAS DTYPES ---
+        # This prevents Pandas from "optimizing" 24.0 into 24 (int)
         
-        # 4. Run prediction
+        for feature in MODEL_TABULAR_FEATURES:
+            if feature in MODEL_INT_FEATURES:
+                input_df[feature] = input_df[feature].astype('int64')
+            else:
+                input_df[feature] = input_df[feature].astype('float64')
+            
+        input_df = pd.DataFrame(final_input)
+        
         prediction_start = time.time()
         prediction, confidence = model.predict(input_df)
         prediction_time = time.time() - prediction_start
         
         # Convert to Python native types
-        is_toxic = bool(prediction)
-        confidence_score = float(confidence)
-        
+        is_toxic = bool(prediction[0]) if hasattr(prediction, '__iter__') else bool(prediction)
+        confidence_score = float(confidence[0]) if hasattr(confidence, '__iter__') else float(confidence)
         # 5. Track metrics
+        if confidence_score < 0.5:
+            confidence_score = 1.0 - confidence_score
         PREDICTION_LATENCY.observe(prediction_time)
         TOXICITY_PREDICTIONS.labels(
             result="toxic" if is_toxic else "non_toxic"
@@ -316,7 +443,7 @@ def predict(request: PredictionRequest):
             "timestamp": datetime.now().isoformat(),
             "user_id": request.user_id,
             "text": request.text[:250] + "..." if len(request.text) > 250 else request.text,  # Truncate for privacy
-            "prediction": int(prediction),
+            "prediction": int(is_toxic),
             "confidence": confidence_score,
             "model_version": model_meta["version"],
             "processing_time_ms": round((time.time() - request_start) * 1000, 2),

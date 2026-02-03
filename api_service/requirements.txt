@@ -13,3 +13,8 @@ boto3
 pydantic
 redis
 prometheus-client
+python-dotenv
+scikit-learn==1.6.1 
+transformers==4.57.6 
+torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+prometheus-client

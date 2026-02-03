@@ -1,11 +1,11 @@
 import os
-import load_dotenv
+from dotenv import load_dotenv
 
 load_dotenv()
 
 class Config():
-    DISCORD_TOKEN = os.get_env('DISCORD_BOT_TOKEN')
-    API_BASE_URL = os.get_env('BASE_URL')
+    DISCORD_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+    API_BASE_URL = os.getenv('BASE_URL')
     DB_PATH = os.getenv("DB_PATH", "bot_memory.db")
  
     UNCERTAINTY_THRESHOLD_LOW = 0.45

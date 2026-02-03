@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from collections import defaultdict
 import hashlib
-
+from .utils import calculate_text_features
 # Rich terminal formattin
 try:
     from rich.console import Console
@@ -323,7 +323,7 @@ def interactive_labeling(
             label_str = "toxic" if label == 1 else "safe"
         
         # Calculate features
-        features = calculate_static_features(candidate['message'])
+        features = calculate_text_features(candidate['message'])
         
         # Create training record
         entry = {

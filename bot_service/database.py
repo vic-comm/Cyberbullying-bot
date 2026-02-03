@@ -24,7 +24,7 @@ class DatabaseManager:
 
     def __init__(self, db_path: str = 'bot_memory.db'):
         self.db_path = db_path
-        self._conn = Optional[aiosqlite.Connection] = None
+        self._conn : Optional[aiosqlite.Connection] = None
 
     async def init_db(self):
         """Initialize database schema"""

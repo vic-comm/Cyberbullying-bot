@@ -429,9 +429,18 @@ class CyberBullyingModelWrapper(mlflow.pyfunc.PythonModel):
         
         # Load DistilBERT
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
-        self.bert_model = DistilBertModel.from_pretrained('distilbert-base-uncased').to(self.device)
-        self.bert_model.eval()
+        bert_path = os.getenv("BAKED_BERT_PATH", 'distilbert-base-uncased')
+        
+        print(f"🤖 Loading BERT from: {bert_path}")
+        
+        try:
+            self.tokenizer = DistilBertTokenizer.from_pretrained(bert_path)
+            self.bert_model = DistilBertModel.from_pretrained(bert_path).to(self.device)
+            self.bert_model.eval()
+        except OSError:
+            print(f"Could not load from {bert_path}, falling back to internet download...")
+            self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+            self.bert_model = DistilBertModel.from_pretrained('distilbert-base-uncased').to(self.device)
     
     def _get_bert_embeddings(self, text_list: List[str]) -> np.ndarray:
         """Generate BERT embeddings"""

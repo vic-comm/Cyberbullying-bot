@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from pathlib import Path
-
+from .utils import calculate_text_features
 from prefect import task, flow
 from prefect.deployments import Deployment
 from prefect.server.schemas.schedules import IntervalSchedule
@@ -22,8 +22,8 @@ FEATURE_CONFIG_PATH = os.getenv("FEATURE_CONFIG", "../config/features.json")
 # Data quality thresholds
 MIN_TEXT_LENGTH = 3
 MAX_TEXT_LENGTH = 5000
-MIN_NEW_SAMPLES = 10  # Minimum samples to trigger ingestion
-MAX_NULL_RATIO = 0.3  # Maximum fraction of null values allowed
+MIN_NEW_SAMPLES = 10  
+MAX_NULL_RATIO = 0.3  
 
 # Feature engineering
 TOXIC_KEYWORDS = {
@@ -43,30 +43,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============================================================================
 # DATA LOADING AND VALIDATION
-# ============================================================================
-@task(
-    name="Load and Validate Logs",
-    log_prints=True,
-    retries=2,
-    retry_delay_seconds=30
-)
+@task(name="Load and Validate Logs", log_prints=True, retries=2, retry_delay_seconds=30)
 def load_and_validate_logs() -> Optional[pd.DataFrame]:
-    """
-    Load raw logs from JSONL file with comprehensive validation.
-    
-    Validation checks:
-    - File exists and is readable
-    - JSON parsing succeeds
-    - Required columns present
-    - Data types correct
-    - Text length within bounds
-    - No duplicate samples
-    
-    Returns:
-        Validated DataFrame or None if insufficient data
-    """
     if not os.path.exists(LOGS_PATH):
         logger.warning(f"⚠️  No logs found at {LOGS_PATH}")
         return None
@@ -153,65 +132,22 @@ def load_and_validate_logs() -> Optional[pd.DataFrame]:
         return None
 
 # FEATURE ENGINEERING
-@task(name="Calculate Features",log_prints=True)
+@task(name="Calculate Features", log_prints=True)
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"🔧 Engineering features for {len(df)} samples...")
     
     df = df.copy()
     
-    # ========== TEXT STATISTICS ==========
-    df['msg_len'] = df['text'].str.len()
-    df['word_count'] = df['text'].str.split().str.len()
-    df['avg_word_len'] = df['text'].apply(
-        lambda x: np.mean([len(w) for w in str(x).split()]) if x else 0
-    )
+    logger.info("   -> Applying centralized text feature logic...")
     
-    # ========== CHARACTER PATTERNS ==========
-    df['caps_ratio'] = df['text'].apply(
-        lambda x: sum(1 for c in str(x) if c.isupper()) / len(str(x)) if len(str(x)) > 0 else 0
-    )
+    feature_dicts = df['text'].apply(calculate_text_features).tolist()
     
-    df['digit_ratio'] = df['text'].apply(
-        lambda x: sum(1 for c in str(x) if c.isdigit()) / len(str(x)) if len(str(x)) > 0 else 0
-    )
+    feature_df = pd.DataFrame(feature_dicts)
     
-    df['punctuation_ratio'] = df['text'].apply(
-        lambda x: sum(1 for c in str(x) if c in '!?.,;:') / len(str(x)) if len(str(x)) > 0 else 0
-    )
+   
+    df = pd.concat([df.reset_index(drop=True), feature_df.reset_index(drop=True)], axis=1)
     
-    # ========== LINGUISTIC FEATURES ==========
-    personal_pronouns = ['i', 'me', 'my', 'mine', 'you', 'your', 'yours', 'he', 'she', 'him', 'her']
-    df['personal_pronoun_count'] = df['text'].str.lower().apply(
-        lambda x: sum(1 for word in str(x).split() if word in personal_pronouns)
-    )
-    
-    df['question_mark_count'] = df['text'].str.count(r'\?')
-    df['exclamation_count'] = df['text'].str.count(r'!')
-    
-    df['all_caps_words'] = df['text'].apply(
-        lambda x: sum(1 for w in str(x).split() if w.isupper() and len(w) > 1)
-    )
-    
-    # ========== TOXICITY SIGNALS ==========
-    df['slur_count'] = df['text'].str.lower().apply(
-        lambda x: sum(1 for word in str(x).split() 
-                     if any(slur in word for slur in TOXIC_KEYWORDS['slurs']))
-    )
-    
-    df['threat_count'] = df['text'].str.lower().apply(
-        lambda x: sum(1 for word in str(x).split() 
-                     if any(threat in word for threat in TOXIC_KEYWORDS['threats']))
-    )
-    
-    df['harassment_count'] = df['text'].str.lower().apply(
-        lambda x: sum(1 for word in str(x).split() 
-                     if any(harass in word for harass in TOXIC_KEYWORDS['harassment']))
-    )
-    
-    # ========== USER HISTORY FEATURES ==========
-    # These would ideally come from the feature store
-    # For now, initialize with defaults and compute from available data
-    
+   
     history_features = [
         'user_bad_ratio_7d',
         'user_bad_ratio_30d',
@@ -225,7 +161,6 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     
     for feature in history_features:
         if feature not in df.columns:
-            # Initialize with neutral values
             if 'ratio' in feature or 'trend' in feature:
                 df[feature] = 0.0
             elif 'count' in feature:
@@ -235,17 +170,17 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
             elif 'is_' in feature:
                 df[feature] = 0
     
-    # Compute user-level aggregates if we have historical data
     if 'timestamp' in df.columns:
         df['timestamp_dt'] = pd.to_datetime(df['timestamp'])
         
         # User message frequency
         user_msg_counts = df.groupby('user_id').size()
-        df['user_msg_count_total'] = df['user_id'].map(user_msg_counts)
+        df['user_msg_count_total'] = df['user_id'].map(user_msg_counts).fillna(0)
         
-        # User toxicity rate
-        user_toxic_rates = df.groupby('user_id')['label'].mean()
-        df['user_toxicity_rate'] = df['user_id'].map(user_toxic_rates)
+        # User toxicity rate (if labels exist in this batch)
+        if 'label' in df.columns:
+            user_toxic_rates = df.groupby('user_id')['label'].mean()
+            df['user_toxicity_rate'] = df['user_id'].map(user_toxic_rates).fillna(0)
     
     # ========== TEMPORAL FEATURES ==========
     if 'timestamp' in df.columns:
@@ -256,6 +191,7 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"✅ Feature engineering complete: {len(df.columns)} features")
     
     return df
+
 
 # DATA QUALITY CHECKS
 @task(name="Validate Data Quality",log_prints=True)
@@ -551,7 +487,6 @@ def data_ingestion_flow():
     
     version_control_data()
     
-    drift_report = detect_data_drift(processed_data)
     
     logger.info("\n" + "="*60)
     logger.info("📊 INGESTION SUMMARY")
@@ -559,11 +494,7 @@ def data_ingestion_flow():
     logger.info(f"New samples ingested: {merge_stats['new_samples']}")
     logger.info(f"Total dataset size: {merge_stats['master_size_after']}")
     logger.info(f"Duplicates removed: {merge_stats['duplicates_removed']}")
-    logger.info(f"Drift detected: {drift_report['drift_detected']}")
     logger.info("="*60)
-    
-    if drift_report["drift_detected"]:
-        logger.warning("🔄 Drift detected - retraining recommended")
 
 
 if __name__ == "__main__":
@@ -589,120 +520,6 @@ if __name__ == "__main__":
     else:
         # Run once
         data_ingestion_flow()
-
-
-
-# import pandas as pd
-# import os
-# import json
-# import subprocess
-# from datetime import datetime
-# from prefect import task, flow
-# from prefect.server.schemas.schedules import IntervalSchedule
-
-# # Configuration
-# LOGS_PATH = "../data/raw_logs.jsonl"
-# MASTER_DATA_PATH = "../data/training_data_with_history.parquet"
-# BACKUP_PATH = "../data/training_data_backup.parquet"
-
-# @task(log_prints=True)
-# def load_and_validate_logs():
-#     if not os.path.exists(LOGS_PATH):
-#         print("⚠️ No new logs found.")
-#         return None
-
-#     # Read JSON Lines
-#     new_data = pd.read_json(LOGS_PATH, lines=True)
-    
-#     if new_data.empty:
-#         print("⚠️ Log file is empty.")
-#         return None
-
-    
-#     if 'verified_label' in new_data.columns:
-#         valid_data = new_data.dropna(subset=['verified_label']).copy()
-#         valid_data['label'] = valid_data['verified_label']
-#     else:
-#         print("Using model predictions as labels (Pseudo-labeling)")
-#         valid_data = new_data.rename(columns={'prediction': 'label'})
-
-#     print(f"Loaded {len(valid_data)} new valid samples.")
-#     return valid_data
-
-# @task(log_prints=True)
-# def calculate_features(df):
-#     df['msg_len'] = df['text'].astype(str).apply(len)
-#     df['caps_ratio'] = df['text'].astype(str).apply(lambda x: sum(1 for c in x if c.isupper())/len(x) if len(x)>0 else 0)
-    
-#     bad_words = ["trash", "kill", "die", "ugly", "stupid"] 
-#     df['slur_count'] = df['text'].astype(str).apply(lambda x: sum(1 for w in bad_words if w in x.lower()))
-    
-#     cols_needed = ['user_bad_ratio_7d', 'user_toxicity_trend', 'channel_toxicity_ratio', 
-#                    'hours_since_last_msg', 'is_new_to_channel']
-    
-#     for col in cols_needed:
-#         if col not in df.columns:
-#             df[col] = 0.0 
-            
-#     return df
-
-# @task(log_prints=True)
-# def merge_and_save(new_df):
-#     if new_df is None: return
-
-#     master_df = pd.read_parquet(MASTER_DATA_PATH)
-    
-#     common_cols = master_df.columns.intersection(new_df.columns)
-#     new_df_aligned = new_df[common_cols]
-    
-#     combined_df = pd.concat([master_df, new_df_aligned], ignore_index=True)
-    
-#     combined_df.drop_duplicates(subset=['text', 'user_id', 'timestamp'], inplace=True)
-    
-#     master_df.to_parquet(BACKUP_PATH)
-    
-#     combined_df.to_parquet(MASTER_DATA_PATH)
-#     print(f"✅ Merged. Total size: {len(combined_df)} rows (+{len(new_df_aligned)} new).")
-    
-#     # Clear the logs file (so we don't re-ingest next time)
-#     open(LOGS_PATH, 'w').close() 
-
-# @task(log_prints=True)
-# def version_control_data():
-#     print("Versioning data with DVC...")
-    
-#     subprocess.run(["dvc", "add", MASTER_DATA_PATH], check=True)
-    
-#     subprocess.run(["dvc", "push"], check=True) 
-    
-#     dvc_file = f"{MASTER_DATA_PATH}.dvc"
-#     timestamp = datetime.now().strftime("%Y-%m-%d")
-#     subprocess.run(["git", "add", dvc_file], check=True)
-#     subprocess.run(["git", "commit", "-m", f"Auto-ingest logs: {timestamp}"], check=True)
-    
-#     print("Data versioned and committed to Git.")
-
-# @flow(name="Data Ingestion Pipeline")
-# def data_ingestion_flow():
-#     new_data = load_and_validate_logs()
-#     if new_data is not None:
-#         processed_data = calculate_features(new_data)
-#         merge_and_save(processed_data)
-#         version_control_data()
-
-# if __name__ == "__main__":
-#     import argparse
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument("--schedule", action="store_true", help="Deploy 2-week schedule")
-#     args = parser.parse_args()
-    
-#     if args.schedule:
-#         data_ingestion_flow.serve(
-#             name="biweekly-data-ingestion",
-#             interval=1209600 # 2 weeks in seconds
-#         )
-#     else:
-#         data_ingestion_flow()
 
 # # cyberbullying-bot/
 # # │

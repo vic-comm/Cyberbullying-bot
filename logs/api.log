@@ -1,0 +1,82 @@
+2026-02-03 12:57:36,457 - __main__ - INFO -  Starting Cyberbullying Detection API...
+2026-02-03 12:57:36,457 - __main__ - INFO - MLflow URI: http://localhost:5000
+2026-02-03 12:57:36,457 - __main__ - INFO - Model: cyberbullying-detection (Stage: Production)
+2026-02-03 12:57:36,458 - mlops.feature_store - INFO - ✅ Connected to Redis at localhost:6379
+2026-02-03 12:57:36,458 - __main__ - INFO -  Connected to Redis at localhost:6379
+2026-02-03 12:57:36,458 - __main__ - INFO - Loading model from: models:/cyberbullying-detection/Production
+2026-02-03 12:57:36,737 - __main__ - ERROR -  Failed to load model: API request to endpoint /api/2.0/mlflow/registered-models/get-latest-versions failed with error code 403 != 200. Response body: ''
+Traceback (most recent call last):
+  File "/Users/chidera/Projects/cyberbullying_bot/api_service/app.py", line 120, in lifespan
+    model = mlflow.pyfunc.load_model(model_uri)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/tracing/provider.py", line 422, in wrapper
+    is_func_called, result = True, f(*args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/pyfunc/__init__.py", line 1099, in load_model
+    local_path = _download_artifact_from_uri(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/tracking/artifact_utils.py", line 108, in _download_artifact_from_uri
+    repo = get_artifact_repository(artifact_uri=root_uri)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/store/artifact/artifact_repository_registry.py", line 133, in get_artifact_repository
+    return _artifact_repository_registry.get_artifact_repository(artifact_uri)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/store/artifact/artifact_repository_registry.py", line 77, in get_artifact_repository
+    return repository(artifact_uri)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/store/artifact/models_artifact_repo.py", line 69, in __init__
+    ) = ModelsArtifactRepository._get_model_uri_infos(artifact_uri)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/store/artifact/models_artifact_repo.py", line 112, in _get_model_uri_infos
+    name, version = get_model_name_and_version(client, uri)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/store/artifact/utils/models.py", line 99, in get_model_name_and_version
+    return model_name, str(_get_latest_model_version(client, model_name, model_stage))
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/store/artifact/utils/models.py", line 31, in _get_latest_model_version
+    latest = client.get_latest_versions(name, None if stage is None else [stage])
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/tracking/_model_registry/client.py", line 161, in get_latest_versions
+    return self.store.get_latest_versions(name, stages)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/store/model_registry/rest_store.py", line 193, in get_latest_versions
+    response_proto = self._call_endpoint(GetLatestVersions, req_body, call_all_endpoints=True)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/store/model_registry/base_rest_store.py", line 39, in _call_endpoint
+    return call_endpoints(
+           ^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/utils/rest_utils.py", line 415, in call_endpoints
+    return call_endpoint(
+           ^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/utils/rest_utils.py", line 402, in call_endpoint
+    response = verify_rest_response(response, endpoint)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/chidera/miniconda3/envs/bully/lib/python3.12/site-packages/mlflow/utils/rest_utils.py", line 265, in verify_rest_response
+    raise MlflowException(
+mlflow.exceptions.MlflowException: API request to endpoint /api/2.0/mlflow/registered-models/get-latest-versions failed with error code 403 != 200. Response body: ''
+2026-02-03 12:57:36,742 - __main__ - WARNING -   Server starting without model - predictions will fail
+2026-02-03 12:59:02,046 - __main__ - INFO - GET / - Status: 200 - Duration: 0.002s
+2026-02-03 12:59:02,448 - __main__ - INFO - GET /favicon.ico - Status: 404 - Duration: 0.000s
+2026-02-03 12:59:08,220 - __main__ - INFO - GET /docs - Status: 200 - Duration: 0.000s
+2026-02-03 12:59:09,749 - __main__ - INFO - GET /openapi.json - Status: 200 - Duration: 0.015s
+2026-02-03 13:02:53,611 - __main__ - INFO - 🛑 Shutting down API...
+2026-02-03 13:02:53,611 - __main__ - INFO - Closed Redis connection
+2026-02-03 13:02:59,311 - __main__ - INFO -  Starting Cyberbullying Detection API...
+2026-02-03 13:02:59,311 - __main__ - INFO - MLflow URI: https://dagshub.com/obiezuevictor/Cyberbullying-bot.mlflow
+2026-02-03 13:02:59,311 - __main__ - INFO - Model: cyberbullying-detection (Stage: Production)
+2026-02-03 13:02:59,313 - mlops.feature_store - INFO - ✅ Connected to Redis at localhost:6379
+2026-02-03 13:02:59,313 - __main__ - INFO -  Connected to Redis at localhost:6379
+2026-02-03 13:02:59,313 - __main__ - INFO - Loading model from: models:/cyberbullying-detection/Production
+2026-02-03 13:03:03,296 - botocore.credentials - INFO - Found credentials in environment variables.
+2026-02-03 13:14:58,895 - __main__ - INFO -  Starting Cyberbullying Detection API...
+2026-02-03 13:14:58,895 - __main__ - INFO - MLflow URI: https://dagshub.com/obiezuevictor/Cyberbullying-bot.mlflow
+2026-02-03 13:14:58,895 - __main__ - INFO - Model: cyberbullying-detection (Stage: Production)
+2026-02-03 13:14:58,896 - mlops.feature_store - INFO - ✅ Connected to Redis at localhost:6379
+2026-02-03 13:14:58,896 - __main__ - INFO -  Connected to Redis at localhost:6379
+2026-02-03 13:14:58,897 - __main__ - INFO - Loading model from: models:/cyberbullying-detection/Production
+2026-02-03 13:15:01,694 - botocore.credentials - INFO - Found credentials in environment variables.
+2026-02-03 13:17:34,867 - urllib3.connectionpool - WARNING - Connection pool is full, discarding connection: cyberbullying-artifacts-victor-obi.s3.amazonaws.com. Connection pool size: 10
+2026-02-03 13:17:38,217 - urllib3.connectionpool - WARNING - Connection pool is full, discarding connection: cyberbullying-artifacts-victor-obi.s3.amazonaws.com. Connection pool size: 10
+2026-02-03 13:17:39,622 - urllib3.connectionpool - WARNING - Connection pool is full, discarding connection: cyberbullying-artifacts-victor-obi.s3.amazonaws.com. Connection pool size: 10
+2026-02-03 13:17:40,306 - urllib3.connectionpool - WARNING - Connection pool is full, discarding connection: cyberbullying-artifacts-victor-obi.s3.amazonaws.com. Connection pool size: 10
+2026-02-03 13:17:42,773 - urllib3.connectionpool - WARNING - Connection pool is full, discarding connection: cyberbullying-artifacts-victor-obi.s3.amazonaws.com. Connection pool size: 10

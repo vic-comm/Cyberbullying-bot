@@ -1,75 +1,3 @@
-# import pandas as pd
-# import redis
-# import os
-# import json
-
-# class FeatureStore:
-#     def __init__(self, redis_host='localhost', redis_port=6379):
-#         self.redis = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
-
-#     def sync_offline_to_online(self, parquet_path, feature_group_name, version="v1"):
-#         print(f" Syncing {parquet_path} to Redis...")
-#         df = pd.read_parquet(parquet_path)
-        
-#         # Use a pipeline for massive speed increase
-#         pipe = self.redis.pipeline()
-        
-#         count = 0
-#         for _, row in df.iterrows():
-#             entity_id = row['user_id']
-            
-#             redis_key = f"{feature_group_name}:{version}:{entity_id}"
-            
-#             # Convert row to JSON (or Hash)
-#             # We filter out the entity_id from the payload to save space
-#             feature_data = row.drop('user_id').to_dict()
-            
-#             # Store as Hash Map in Redis
-#             pipe.hset(redis_key, mapping=feature_data)
-            
-#             # Optional: Set expiry (TTL) to auto-clean old versions if needed
-#             # pipe.expire(redis_key, 86400 * 7) # 7 days
-            
-#             count += 1
-#             if count % 1000 == 0:
-#                 pipe.execute() # Commit batch
-                
-#         pipe.execute() # Commit remaining
-#         print(f"Synced {count} records to Redis key prefix '{feature_group_name}:{version}'")
-
-#     def get_online_features(self, feature_group_name, entity_id, version="v1"):
-#         """
-#         Low-latency fetch for the API.
-#         """
-#         redis_key = f"{feature_group_name}:{version}:{entity_id}"
-#         data = self.redis.hgetall(redis_key)
-        
-#         if not data:
-#             return None
-            
-#         # Redis stores everything as strings, we might need to cast types back
-#         # For a truly lightweight solution, handle type conversion here based on a schema
-#         return data
-
-# if __name__ == "__main__":
-#     fs = FeatureStore()
-#     fs.sync_offline_to_online(
-#         parquet_path="data/training_data_with_history.parquet",
-#         feature_group_name="user_toxicity",
-#         version="prod"
-#     )
-
-# mlops/feature_store.py
-"""
-Lightweight Feature Store implementation using Redis for online serving
-and Parquet for offline storage.
-
-Provides:
-- Low-latency feature retrieval (<10ms p99)
-- Batch syncing from offline to online store
-- Type preservation and validation
-- Connection pooling for production use
-"""
 import json
 import logging
 from typing import Optional, Dict, Any, List
@@ -475,9 +403,7 @@ class FeatureStore:
             self.redis.close()
             logger.info("Closed Redis connection")
 
-# ============================================================================
 # CLI UTILITY
-# ============================================================================
 if __name__ == "__main__":
     import argparse
     

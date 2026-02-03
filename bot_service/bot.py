@@ -3,14 +3,14 @@ import asyncio
 from typing import Optional, Dict, Any
 from datetime import timedelta, datetime
 import re
-
+from datetime import datetime, timezone, timedelta
 import discord
 import aiohttp
 from discord.ext import commands
 from unidecode import unidecode
 
-from database import DatabaseManager, ViolationLevel
-from config import Config
+from bot_service.database import DatabaseManager, ViolationLevel
+from bot_service.config import Config
 
 class ModerationBot(commands.Bot):
     def __init__(self):
@@ -79,7 +79,7 @@ class ModerationService:
             "user_id": str(message.author.id),
             "msg_len": len(message.content),
             "caps_ratio": TextCleaner.calculate_caps_ratio(message.content),
-            "account_age_days": (datetime.utcnow() - message.author.created_at).days,
+            "account_age_days": (datetime.now(timezone.utc) - message.author.created_at).days,
             "previous_violations": user_history.get('count', 0),
             "server_id": str(message.guild.id) if message.guild else None
         }
@@ -120,7 +120,7 @@ class ModerationService:
         if not is_toxic:
             return ViolationLevel.SAFE
         
-        if 0.45 <= confidence <= 0.65:
+        if 0.45 <= confidence <= 0.55:
             return ViolationLevel.UNCERTAIN
         
         violation_count = user_history.get('count', 0)
@@ -327,6 +327,10 @@ async def modstats(ctx: commands.Context, days: int = 7):
 @commands.has_permissions(administrator=True)
 async def clearstrikes(ctx: commands.Context, user: discord.Member):
     await bot.db.clear_violations(str(user.id))
+
+    if user.is_timed_out():
+        await user.timeout(None, reason="Admin cleared strikes")
+        await ctx.send(f"Cleared strikes and **removed timeout** for {user.mention}")
     await ctx.send(f"Cleared all strikes for {user.mention}")
 
 

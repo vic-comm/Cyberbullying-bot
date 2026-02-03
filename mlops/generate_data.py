@@ -167,55 +167,6 @@ df['user_toxicity_trend'] = df['user_bad_ratio_7d'] - df['user_bad_ratio_30d']
 
 # Clean up NaNs
 df.fillna(0, inplace=True)
-
-# # ==========================================
-# # 7. CHANNEL-LEVEL FEATURES
-# # ==========================================
-# print("Computing Channel Context Features...")
-
-# grouped_channel = df_indexed.groupby('channel_id')
-
-# # Channel toxicity in last 24 hours
-# df['channel_24h_msg_count'] = grouped_channel['label'].rolling('24H', closed='left').count().values
-# df['channel_24h_bad_count'] = grouped_channel['label'].rolling('24H', closed='left').sum().values
-# df['channel_toxicity_ratio'] = df['channel_24h_bad_count'] / df['channel_24h_msg_count']
-
-# df.fillna(0, inplace=True)
-
-# # ==========================================
-# # 8. INTERACTION FEATURES
-# # ==========================================
-# print("Computing Interaction Features...")
-
-# # Time since user's last message (in hours)
-# df['hours_since_last_msg'] = df.groupby('user_id')['timestamp'].diff().dt.total_seconds() / 3600
-# df['hours_since_last_msg'] = df['hours_since_last_msg'].fillna(24)  # Default for first message
-
-# # Is this user new to the channel? (first 3 messages in channel)
-# df['user_channel_msg_count'] = df.groupby(['user_id', 'channel_id']).cumcount() + 1
-# df['is_new_to_channel'] = (df['user_channel_msg_count'] <= 3).astype(int)
-
-# # ==========================================
-# # 9. SAVE
-# # ==========================================
-# print("Saving Feature-Rich Dataset...")
-# df = df.reset_index(drop=True)
-# df.to_parquet(OUTPUT_FILE, index=False)
-
-# print(f"\nDone! Saved to {OUTPUT_FILE}")
-# print(f"\nSample of features:")
-# feature_cols = ['text', 'label', 'user_id', 'msg_len', 'caps_ratio', 'personal_pronoun_count',
-#                 'user_7d_bad_count', 'user_bad_ratio_7d', 'user_toxicity_trend', 
-#                 'channel_toxicity_ratio', 'hours_since_last_msg']
-# print(df[feature_cols].head(10))
-
-# print(f"\nFeature summary:")
-# print(f"Total features: {len(df.columns)}")
-# print(f"Message-level features: 10")
-# print(f"User historical features: 8")
-# print(f"Channel context features: 4")
-# print(f"Interaction features: 3")
-
 # ==========================================
 # 7. CHANNEL-LEVEL FEATURES
 # ==========================================

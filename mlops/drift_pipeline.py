@@ -1,19 +1,3 @@
-# drift_detection.py
-"""
-Production Drift Detection System for Cyberbullying Detection
-
-Monitors data and model drift in production, generates detailed reports,
-and triggers alerts/retraining when thresholds are exceeded.
-
-Key Features:
-- Statistical drift detection (KS, PSI, Chi-square tests)
-- Semantic drift detection via embeddings
-- Label distribution monitoring
-- Model performance degradation tracking
-- Automated alerting (Slack, email, PagerDuty)
-- Integration with Prefect for scheduling
-- Metric tracking to Prometheus
-"""
 import pandas as pd
 import numpy as np
 import json
@@ -44,9 +28,7 @@ from scipy import stats
 from prefect import task, flow
 from prometheus_client import Gauge, Counter, push_to_gateway
 
-# ============================================================================
 # CONFIGURATION
-# ============================================================================
 REFERENCE_DATA_PATH = os.getenv("REFERENCE_DATA_PATH", "data/training_data_with_history.parquet")
 CURRENT_LOGS_PATH = os.getenv("CURRENT_LOGS_PATH", "data/raw_logs.jsonl")
 PRODUCTION_LOGS_PATH = os.getenv("PRODUCTION_LOGS_PATH", "data/production_logs.jsonl")
@@ -70,7 +52,6 @@ DRIFT_THRESHOLDS = {
     "performance_drop": 0.05      # 5% drop in model metrics
 }
 
-# Minimum samples for reliable drift detection
 MIN_SAMPLES_FOR_DRIFT = 100
 
 # Toxic keywords for monitoring
@@ -90,9 +71,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ============================================================================
 # PROMETHEUS METRICS
-# ============================================================================
 DRIFT_SCORE = Gauge(
     'drift_detection_score',
     'Overall drift score',
@@ -110,9 +89,7 @@ SAMPLES_ANALYZED = Counter(
     'Number of samples analyzed for drift'
 )
 
-# ============================================================================
 # DATA LOADING
-# ============================================================================
 @task(name="Load Reference and Current Data", log_prints=True, retries=2)
 def load_data() -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """
@@ -126,19 +103,19 @@ def load_data() -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     # Load reference data
     try:
         if not os.path.exists(REFERENCE_DATA_PATH):
-            logger.error(f"❌ Reference data not found: {REFERENCE_DATA_PATH}")
+            logger.error(f" Reference data not found: {REFERENCE_DATA_PATH}")
             return None, None
         
         reference = pd.read_parquet(REFERENCE_DATA_PATH)
-        logger.info(f"✅ Loaded reference data: {len(reference)} samples")
+        logger.info(f" Loaded reference data: {len(reference)} samples")
         
         # Basic validation
         if 'text' not in reference.columns:
-            logger.error("❌ Reference data missing 'text' column")
+            logger.error(" Reference data missing 'text' column")
             return None, None
             
     except Exception as e:
-        logger.error(f"❌ Failed to load reference data: {e}", exc_info=True)
+        logger.error(f" Failed to load reference data: {e}", exc_info=True)
         return None, None
     
     # Load current production data
@@ -153,46 +130,44 @@ def load_data() -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
                     temp_df = pd.read_json(source, lines=True)
                     if not temp_df.empty:
                         current = temp_df if current is None else pd.concat([current, temp_df])
-                        logger.info(f"✅ Loaded {len(temp_df)} samples from {source}")
+                        logger.info(f" Loaded {len(temp_df)} samples from {source}")
                 except Exception as e:
-                    logger.warning(f"⚠️  Could not read {source}: {e}")
+                    logger.warning(f" Could not read {source}: {e}")
         
         if current is None or current.empty:
-            logger.warning("⚠️  No current production data found")
+            logger.warning("  No current production data found")
             return reference, None
         
         # Deduplicate current data
         if 'text_hash' in current.columns:
             before = len(current)
             current = current.drop_duplicates(subset=['text_hash'])
-            logger.info(f"🔄 Removed {before - len(current)} duplicate samples")
+            logger.info(f" Removed {before - len(current)} duplicate samples")
         
         # Validate minimum samples
         if len(current) < MIN_SAMPLES_FOR_DRIFT:
             logger.warning(
-                f"⚠️  Only {len(current)} samples (minimum: {MIN_SAMPLES_FOR_DRIFT}). "
+                f"  Only {len(current)} samples (minimum: {MIN_SAMPLES_FOR_DRIFT}). "
                 f"Drift detection may be unreliable."
             )
         
         # Align columns between reference and current
         common_cols = list(set(reference.columns) & set(current.columns))
-        logger.info(f"📊 Using {len(common_cols)} common columns for comparison")
+        logger.info(f" Using {len(common_cols)} common columns for comparison")
         
         reference = reference[common_cols]
         current = current[common_cols]
         
-        logger.info(f"✅ Loaded current data: {len(current)} samples")
+        logger.info(f" Loaded current data: {len(current)} samples")
         SAMPLES_ANALYZED.inc(len(current))
         
         return reference, current
         
     except Exception as e:
-        logger.error(f"❌ Failed to load current data: {e}", exc_info=True)
+        logger.error(f" Failed to load current data: {e}", exc_info=True)
         return reference, None
 
-# ============================================================================
 # STATISTICAL DRIFT TESTS
-# ============================================================================
 def kolmogorov_smirnov_test(ref_data: pd.Series, cur_data: pd.Series) -> Dict[str, float]:
     """
     Perform KS test for continuous numerical features.
@@ -339,7 +314,7 @@ def detect_statistical_drift(
         
         if feature_result["drifted"]:
             drift_results["drifted_features"].append(feature)
-            logger.warning(f"  ⚠️  Drift detected in {feature}")
+            logger.warning(f"    Drift detected in {feature}")
     
     # Label distribution drift
     if 'label' in reference.columns and 'label' in current.columns:
@@ -360,7 +335,7 @@ def detect_statistical_drift(
         
         if label_shift > DRIFT_THRESHOLDS["label_distribution_shift"]:
             drift_results["drifted_features"].append("label_distribution")
-            logger.warning(f"  ⚠️  Label distribution shift: {label_shift:.2%}")
+            logger.warning(f"    Label distribution shift: {label_shift:.2%}")
     
     # Overall drift decision
     drift_share = len(drift_results["drifted_features"]) / max(len(drift_results["features"]), 1)
@@ -368,24 +343,19 @@ def detect_statistical_drift(
     drift_results["overall_drift_detected"] = drift_share > DRIFT_THRESHOLDS["dataset_drift_share"]
     
     if drift_results["overall_drift_detected"]:
-        logger.warning(f"🚨 DRIFT DETECTED: {len(drift_results['drifted_features'])} features drifted")
+        logger.warning(f" DRIFT DETECTED: {len(drift_results['drifted_features'])} features drifted")
         DRIFT_DETECTED.labels(severity="high").inc()
     else:
-        logger.info("✅ No significant statistical drift detected")
+        logger.info(" No significant statistical drift detected")
     
     # Update Prometheus metrics
     DRIFT_SCORE.labels(metric_type="statistical").set(drift_share)
     
     return drift_results
 
-# ============================================================================
 # EVIDENTLY REPORT GENERATION
-# ============================================================================
 @task(name="Generate Evidently Report", log_prints=True)
-def generate_evidently_report(
-    reference: pd.DataFrame,
-    current: pd.DataFrame
-) -> str:
+def generate_evidently_report(reference: pd.DataFrame, current: pd.DataFrame) -> str:
     """
     Generate comprehensive drift report using Evidently AI.
     
@@ -455,9 +425,7 @@ def generate_evidently_report(
         logger.error(f"❌ Evidently report generation failed: {e}", exc_info=True)
         return None
 
-# ============================================================================
 # ALERTING
-# ============================================================================
 def send_slack_alert(drift_results: Dict[str, Any]):
     """Send drift alert to Slack"""
     if not SLACK_WEBHOOK_URL:
@@ -532,9 +500,7 @@ def send_alerts(drift_results: Dict[str, Any]):
         logger.info("📟 PagerDuty alert would be triggered")
         # Implement PagerDuty integration here
 
-# ============================================================================
 # METRICS PERSISTENCE
-# ============================================================================
 @task(name="Save Drift Metrics", log_prints=True)
 def save_drift_metrics(drift_results: Dict[str, Any]):
     """
@@ -626,15 +592,13 @@ def drift_detection_flow():
     
     # Return recommendation
     if drift_results['overall_drift_detected']:
-        logger.warning("🔄 RECOMMENDATION: Retrain model to address drift")
+        logger.warning("RECOMMENDATION: Retrain model to address drift")
         return "retrain_recommended"
     else:
-        logger.info("✅ Model performance likely stable")
+        logger.info("Model performance likely stable")
         return "no_action_needed"
 
-# ============================================================================
 # CLI
-# ============================================================================
 if __name__ == "__main__":
     import argparse
     

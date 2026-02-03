@@ -21,5 +21,7 @@ data/*.db
 *.pt
 
 .csv
-
+bot_memory.db
+baked_bert
+baked_model
 artifacts/
