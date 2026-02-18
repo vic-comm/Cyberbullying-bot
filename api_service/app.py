@@ -3,25 +3,29 @@ import json
 import os
 import logging
 from typing import Optional, Dict, Any
+from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from datetime import datetime
-
+import boto3
 import mlflow.pyfunc
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi_utils.tasks import repeat_every
 from fastapi.responses import JSONResponse
 from prometheus_client import Counter, Histogram, Gauge, generate_latest
 from prometheus_client import CONTENT_TYPE_LATEST
 from starlette.responses import Response
 from mlflow.tracking import MlflowClient
-
 from mlops.feature_store import FeatureStore
 from mlops.utils import calculate_text_features
 from api_service.schemas import PredictionRequest, PredictionResponse
+from api_service.explainer import ToxicityExplainer
 from pathlib import Path
 from dotenv import load_dotenv
-
+import contextlib
+import asyncio
+from scripts import sync_bot_to_logs
 load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent.parent
 LOGS_DIR = BASE_DIR / "logs"
@@ -32,10 +36,11 @@ MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
 EXPERIMENT_NAME = os.getenv("EXPERIMENT_NAME", "cyberbullying-detection")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
-LOGS_PATH = os.getenv("LOGS_PATH", "../data/raw_logs.jsonl")
+LOGS_PATH = os.getenv("LOGS_PATH", "data/raw_logs.jsonl")
 STAGE = os.getenv("MODEL_STAGE", "Production")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-
+BUCKET_NAME = os.getenv("BUCKET_NAME") 
+S3_LOGS_KEY = os.getenv("S3_LOGS_KEY", "logs/raw_logs.jsonl") 
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -90,6 +95,7 @@ model_meta: Dict[str, Any] = {
     "stage": STAGE
 }
 fs: Optional[FeatureStore] = None
+explainer_service = None
 
 MODEL_TABULAR_FEATURES = [
     'msg_len', 
@@ -110,84 +116,15 @@ MODEL_INT_FEATURES = [
     'is_new_to_channel'
 ]
 
-# LIFESPAN MANAGEMENT
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     """
-#     Manage application startup and shutdown.
-#     - Loads model from MLflow on startup
-#     - Initializes feature store connection
-#     - Handles graceful shutdown
-#     """
-#     global model, model_meta, fs
-    
-#     logger.info(" Starting Cyberbullying Detection API...")
-#     logger.info(f"MLflow URI: {MLFLOW_TRACKING_URI}")
-#     logger.info(f"Model: {EXPERIMENT_NAME} (Stage: {STAGE})")
-    
-#     # Initialize Feature Store
-#     try:
-#         fs = FeatureStore(redis_host=REDIS_HOST, redis_port=REDIS_PORT)
-#         logger.info(f" Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
-#     except Exception as e:
-#         logger.error(f" Failed to connect to Redis: {e}")
-#         logger.warning("  API will start but feature enrichment will fail")
-    
-#     # Load Model from MLflow
-#     try:
-#         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-#         model_uri = f"models:/{EXPERIMENT_NAME}/{STAGE}"
-        
-#         logger.info(f"Loading model from: {model_uri}")
-#         model = mlflow.pyfunc.load_model(model_uri)
-        
-#         # Fetch model metadata
-#         client = MlflowClient()
-#         versions = client.get_latest_versions(EXPERIMENT_NAME, stages=[STAGE])
-        
-#         if versions:
-#             model_version = versions[0].version
-#             model_meta.update({
-#                 "version": model_version,
-#                 "loaded_at": datetime.now().isoformat(),
-#                 "run_id": versions[0].run_id
-#             })
-            
-#             # Update Prometheus metric
-#             MODEL_VERSION.labels(version=model_version).set(1)
-            
-#             logger.info(f" Model v{model_version} loaded successfully!")
-#         else:
-#             logger.warning(f"  No model found in '{STAGE}' stage")
-            
-#     except Exception as e:
-#         logger.error(f" Failed to load model: {e}", exc_info=True)
-#         logger.warning("  Server starting without model - predictions will fail")
-    
-#     # Ensure logs directory exists
-#     os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
-    
-#     yield
-    
-#     # Shutdown
-#     logger.info("🛑 Shutting down API...")
-#     if fs and fs.redis:
-#         fs.redis.close()
-#         logger.info("Closed Redis connection")
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Manage application startup and shutdown.
-    - PRIORITIZES local 'baked' model (Production safe)
-    - Fallback to MLflow Registry (Dev convenience)
-    - Initializes feature store
-    """
-    global model, model_meta, fs
+    global model, model_meta, fs, explainer_service
     
     logger.info("🚀 Starting Cyberbullying Detection API...")
     
+    # -------------------------------------------------
     # 1. Initialize Feature Store
+    # -------------------------------------------------
     try:
         fs = FeatureStore(redis_host=REDIS_HOST, redis_port=REDIS_PORT)
         logger.info(f"✅ Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
@@ -195,9 +132,10 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Failed to connect to Redis: {e}")
         logger.warning("⚠️ API will start but feature enrichment will fail")
     
-    # 2. Load Model (The Critical Fix)
+    # -------------------------------------------------
+    # 2. Load Model
+    # -------------------------------------------------
     try:
-        # Check for baked-in model first (Production Path)
         local_path = os.getenv("MODEL_LOCAL_PATH", "/app/baked_model")
         
         if os.path.exists(local_path):
@@ -212,8 +150,9 @@ async def lifespan(app: FastAPI):
             logger.info("✅ Loaded model from local container (Offline Mode)")
             
         else:
-            # Fallback to Internet Download (Dev Mode)
-            logger.warning(f"⚠️ No local model found at {local_path}. Attempting remote download...")
+            logger.warning(
+                f"⚠️ No local model found at {local_path}. Attempting remote download..."
+            )
             
             mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
             model_uri = f"models:/{EXPERIMENT_NAME}/{STAGE}"
@@ -221,7 +160,6 @@ async def lifespan(app: FastAPI):
             logger.info(f"☁️ Loading from MLflow: {model_uri}")
             model = mlflow.pyfunc.load_model(model_uri)
             
-            # Try to fetch version info (Might fail if offline)
             try:
                 client = MlflowClient()
                 versions = client.get_latest_versions(EXPERIMENT_NAME, stages=[STAGE])
@@ -230,26 +168,47 @@ async def lifespan(app: FastAPI):
             except Exception:
                 model_meta["version"] = "remote-unknown"
 
-            logger.info(f"✅ Loaded model from MLflow Registry")
+            logger.info("✅ Loaded model from MLflow Registry")
 
     except Exception as e:
         logger.error(f"❌ CRITICAL: Failed to load model: {e}", exc_info=True)
-        # We generally want the app to crash if the model is missing, 
-        # otherwise Kubernetes/Docker thinks it's healthy when it's useless.
-        # But for debugging, we let it run.
     
-    # Ensure logs directory exists
-    os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
+    if model is not None:
+        try:
+            explainer_service = ToxicityExplainer(
+                model_pipeline=model, 
+                feature_calculator=calculate_text_features,
+                model_tabular_features=MODEL_TABULAR_FEATURES,
+                model_int_features=MODEL_INT_FEATURES
+            )
+            logger.info("✅ Explainer initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize explainer: {e}", exc_info=True)
+    else:
+        logger.warning("⚠️ Skipping explainer initialization (model not loaded)")
     
-    yield
-    
-    # Shutdown
-    logger.info("🛑 Shutting down API...")
-    if fs and fs.redis:
-        fs.redis.close()
-        logger.info("👋 Closed Redis connection")
+    scheduler_task = asyncio.create_task(run_periodic_sync())
+    logger.info(" Periodic sync scheduler started")
 
-# FASTAPI APP INITIALIZATION
+    os.makedirs(os.path.dirname(LOGS_PATH), exist_ok=True)
+
+    try:
+        yield
+    finally:
+        logger.info(" Shutting down API...")
+
+        # Stop scheduler cleanly
+        scheduler_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await scheduler_task
+        logger.info(" Scheduler stopped")
+
+        # Close Redis
+        if fs and fs.redis:
+            fs.redis.close()
+            logger.info(" Closed Redis connection")
+
+
 app = FastAPI(
     title="Cyberbullying Detection API",
     description="Real-time toxicity detection with MLflow model serving",
@@ -408,12 +367,9 @@ def predict(request: PredictionRequest):
         final_input = { 'text': [request.text] }
         for feature in MODEL_TABULAR_FEATURES:
             raw_val = input_dict.get(feature, 0)
-            final_input[feature] = [raw_val] # Just put the value in, we cast later
+            final_input[feature] = [raw_val] 
             
         input_df = pd.DataFrame(final_input)
-        
-        # --- THE FIX: FORCE PANDAS DTYPES ---
-        # This prevents Pandas from "optimizing" 24.0 into 24 (int)
         
         for feature in MODEL_TABULAR_FEATURES:
             if feature in MODEL_INT_FEATURES:
@@ -421,7 +377,6 @@ def predict(request: PredictionRequest):
             else:
                 input_df[feature] = input_df[feature].astype('float64')
             
-        input_df = pd.DataFrame(final_input)
         
         prediction_start = time.time()
         prediction, confidence = model.predict(input_df)
@@ -474,14 +429,87 @@ def predict(request: PredictionRequest):
             detail=f"Prediction failed: {str(e)}"
         )
 
+def upload_logs_to_s3():
+    if not BUCKET_NAME:
+        return
+
+    s3 = boto3.client('s3')
+    
+    
+    try:
+        # 1. Download existing S3 logs (if they exist)
+        try:
+            s3.download_file(BUCKET_NAME, S3_LOGS_KEY, LOGS_PATH)
+            # Read existing hashes to avoid duplicates
+            existing_hashes = set()
+            with open(LOGS_PATH, 'r') as f:
+                for line in f:
+                    try: 
+                        log = json.loads(line)
+                        if 'text_hash' in log: existing_hashes.add(log['text_hash'])
+                    except: continue
+        except Exception:
+            # File doesn't exist in S3 yet (first run)
+            existing_hashes = set()
+            open(LOGS_PATH, 'w').close() # Create empty file
+
+        # 2. Read new local logs
+        if not os.path.exists(LOGS_PATH):
+            return
+
+        new_records = []
+        with open(LOGS_PATH, 'r') as f:
+            for line in f:
+                try:
+                    log = json.loads(line)
+                    # Only add if not already in S3
+                    if log.get('text_hash') not in existing_hashes:
+                        new_records.append(line.strip())
+                except: continue
+        
+        if not new_records:
+            print("✅ S3 is already up to date.")
+            return
+
+        # 3. Append new records to the temp S3 file
+        with open(LOGS_PATH, 'a') as f:
+            for record in new_records:
+                f.write(record + '\n')
+
+        # 4. Upload the combined file back to S3
+        s3.upload_file(LOGS_PATH, BUCKET_NAME, S3_LOGS_KEY)
+        print(f"✅ Appended {len(new_records)} new records to S3.")
+        
+        # Cleanup
+        if os.path.exists(LOGS_PATH):
+            os.remove(LOGS_PATH)
+
+    except Exception as e:
+        print(f"❌ S3 Sync failed: {e}")
+
+async def run_periodic_sync():
+    while True:
+        try:
+            logger.info("⏳ Waiting 12 hours for next sync...")
+            await asyncio.sleep(43200)  
+            
+            logger.info("🔄 Running Sync & Upload...")
+            
+            records = await asyncio.to_thread(sync_bot_to_logs, lookback_hours=24)
+            if records > 0:
+                logger.info(f"   Synced {records} new records.")
+            
+            await asyncio.to_thread(upload_logs_to_s3)
+            
+        except asyncio.CancelledError:
+            logger.info("Sync task cancelled.")
+            break
+        except Exception as e:
+            logger.error(f"Background sync failed: {e}", exc_info=True)
+            await asyncio.sleep(60) 
+
 @app.post("/reload-model")
 def reload_model():
-    """
-    Hot-reload the production model without restarting the server.
-    Useful for zero-downtime deployments.
-    
-    Note: In production, this should be protected with authentication.
-    """
     global model, model_meta
     
     logger.info("Model reload requested...")
@@ -527,6 +555,70 @@ def reload_model():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Model reload failed: {str(e)}"
         )
+
+class ExplanationRequest(BaseModel):
+    text: str
+    user_id: Optional[str] = None
+    channel_id: Optional[str] = None
+    num_features: int = 6  
+    
+    class Config:
+        extra = "allow"
+@app.post("/explain")
+async def explain_text(payload: ExplanationRequest):
+    """
+    Returns LIME explanation for a given text using the SAME features as /predict
+    Body: {
+        "text": "You are stupid",
+        "user_id": "user_123",
+        "channel_id": "channel_456",
+        "msg_len": 15,
+        ... (any other features you have)
+    }
+    """
+    if explainer_service is None:
+        logger.error("❌ /explain called but explainer_service is None")
+        raise HTTPException(
+            status_code=503,
+            detail="Explainer not initialized. Model may have failed to load."
+        )
+    
+    text = payload.text
+    logger.info(f"DEBUG /explain called with text: '{text[:50]}'")
+    logger.info(f"DEBUG explainer_service type: {type(explainer_service)}")
+    logger.info(f"DEBUG explainer_service.pipeline: {explainer_service.pipeline}")
+    if not text:
+        return {"error": "No text provided"}
+    
+    request_dict = payload.model_dump()    
+    static_features = calculate_text_features(text)
+    request_dict.update(static_features)
+    
+    redis_defaults = {
+        'user_bad_ratio_7d': 0.0,
+        'user_toxicity_trend': 0.0,
+        'channel_toxicity_ratio': 0.0,
+        'hours_since_last_msg': 24.0,
+        'is_new_to_channel': 1
+    }
+    request_dict.update(redis_defaults)
+    
+    user_id = payload.user_id
+    if fs and user_id:
+        try:
+            user_features = fs.get_online_features(
+                feature_group_name="user_toxicity",
+                entity_id=user_id,
+                version="prod"
+            )
+            if user_features:
+                request_dict.update(user_features)
+                logger.debug(f"Enriched explanation with features for user {user_id}")
+        except Exception as e:
+            logger.warning(f"Feature enrichment failed for explanation: {e}")
+    
+    explanation = explainer_service.explain(text, request_dict)
+    return explanation
 
 if __name__ == "__main__":
     import uvicorn

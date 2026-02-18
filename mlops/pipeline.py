@@ -6,7 +6,7 @@ from typing import Optional
 import load_dotenv
 import mlflow
 from mlflow.tracking import MlflowClient
-from prefect import flow
+# from prefect import flow
 
 # Add parent directory to path for imports
 sys.path.append(str(Path(__file__).parent))
@@ -155,7 +155,7 @@ def validate_environment():
 
 
 # MAIN PIPELINE
-@flow(name="Cyberbullying Detection Training Pipeline", log_prints=True)
+# @flow(name="Cyberbullying Detection Training Pipeline", log_prints=True)
 def main_flow(use_dvc: bool = False, n_trials: int = 50, force_recompute: bool = False, models: Optional[str] = None):
     print("\n" + "="*80)
     print(" " * 20 + "CYBERBULLYING DETECTION")
@@ -253,50 +253,71 @@ def main_flow(use_dvc: bool = False, n_trials: int = 50, force_recompute: bool =
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(
-        description="Cyberbullying Detection Training Pipeline",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Run full pipeline with default settings
-  python train.py
-  
-  # Pull data from DVC and run with 100 trials
-  python train.py --dvc --trials 100
-  
-  # Force recompute embeddings and train only XGBoost
-  python train.py --force-recompute --models xgboost
-  
-  # Deploy as Prefect flow
-  python train.py --mode serve --trials 50
-        """
-    )
+    # 1. Parse Args (with Env Var defaults for Cloud)
+    parser = argparse.ArgumentParser(description="Cyberbullying Detection Training Pipeline")
     
-    parser.add_argument("--mode", choices=["serve", "run"], default="run", help="Execution mode: 'serve' for Prefect deployment, 'run' for direct execution")
-    parser.add_argument("--dvc", action="store_true", help="Pull data from DVC before training")
-    parser.add_argument("--trials", type=int, default=50, help="Number of Optuna trials for hyperparameter tuning (default: 50)")
-    parser.add_argument("--force-recompute", action="store_true", help="Ignore cache and regenerate BERT embeddings")
-    parser.add_argument("--models", type=str, default=None, help="Comma-separated list of models to train: xgboost,lightgbm,logistic (default: all)")
+    # DEFAULT: "run" (Execute once and exit - Perfect for Fargate)
+    parser.add_argument("--mode", choices=["serve", "run"], default="run", 
+                       help="Execution mode: 'serve' for Prefect deployment, 'run' for direct execution")
+    
+    # Use ENV VARS for defaults (allows configuring via AWS Task Definition)
+    parser.add_argument("--dvc", action="store_true", 
+                       default=os.getenv("USE_DVC", "False").lower() == "true",
+                       help="Pull data from DVC (Default: env.USE_DVC)")
+    
+    parser.add_argument("--trials", type=int, 
+                       default=int(os.getenv("OPTUNA_TRIALS", "50")),
+                       help="Optuna trials (Default: env.OPTUNA_TRIALS)")
+    
+    parser.add_argument("--force-recompute", action="store_true", 
+                       default=os.getenv("FORCE_RECOMPUTE", "False").lower() == "true",
+                       help="Regenerate embeddings (Default: env.FORCE_RECOMPUTE)")
+    
+    parser.add_argument("--models", type=str, 
+                       default=os.getenv("TRAIN_MODELS", None),
+                       help="Models to train (Default: env.TRAIN_MODELS)")
     
     args = parser.parse_args()
     
+    # 2. Execution Logic
     if args.mode == "serve":
+        # --- PREFECT AGENT MODE (Local Dev Only) ---
         print("="*80)
-        print(" " * 25 + "PREFECT DEPLOYMENT MODE")
+        print(" PREFECT DEPLOYMENT MODE (Listening...)")
         print("="*80)
-        print("\n Deploying Prefect flow - waiting for triggers...")
-        print("   Use Prefect UI or CLI to trigger runs\n")
-        
         main_flow.serve(
             name='cyberbullying-training',
-            parameters={"use_dvc": args.dvc, "n_trials": args.trials, "force_recompute": args.force_recompute, "models": args.models}
+            parameters={
+                "use_dvc": args.dvc, 
+                "n_trials": args.trials, 
+                "force_recompute": args.force_recompute, 
+                "models": args.models
+            }
         )
+        
     else:
-        print(" Running training pipeline directly...\n")
+        # --- FARGATE / DIRECT EXECUTION MODE ---
+        # This is what runs when AWS starts the container
+        print(f"🚀 Starting Pipeline in '{args.mode}' mode...")
+        print(f"   - DVC Pull: {args.dvc}")
+        print(f"   - Trials: {args.trials}")
+        print(f"   - Force Recompute: {args.force_recompute}")
         
-        result = main_flow(use_dvc=args.dvc, n_trials=args.trials, force_recompute=args.force_recompute, models=args.models)
-        
-        if result:
-            print(f"\n Training completed successfully!")
-            print(f"   Model: {result['model_name']}")
-            print(f"   F2 Score: {result['f2_score']:.4f}")
+        try:
+            # Run the flow immediately
+            result = main_flow(
+                use_dvc=args.dvc, 
+                n_trials=args.trials, 
+                force_recompute=args.force_recompute, 
+                models=args.models
+            )
+            
+            if result:
+                print(f"\n✅ Training Success!")
+                print(f"   Model: {result.get('model_name', 'Unknown')}")
+                print(f"   F2 Score: {result.get('f2_score', 0):.4f}")
+            sys.exit(0) # Success exit code for AWS
+            
+        except Exception as e:
+            print(f"\n❌ Pipeline Failed: {e}")
+            sys.exit(1) # Failure exit code (AWS will mark task as 'FAILED')

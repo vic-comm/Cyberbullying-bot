@@ -2,11 +2,14 @@ import json
 import logging
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
-
+import asyncio
+import asyncpg
 import pandas as pd
 import redis
 from redis.connection import ConnectionPool
-
+from dotenv import load_dotenv
+import os
+load_dotenv()
 logger = logging.getLogger(__name__)
 
 class FeatureStoreError(Exception):
@@ -72,15 +75,7 @@ class FeatureStore:
             logger.error(f"Failed to connect to Redis: {e}")
             raise FeatureStoreError(f"Redis connection failed: {e}")
     
-    def sync_offline_to_online(
-        self,
-        parquet_path: str,
-        feature_group_name: str,
-        version: str = "v1",
-        entity_key: str = "user_id",
-        ttl_days: Optional[int] = None,
-        batch_size: int = 1000
-    ) -> Dict[str, Any]:
+    def sync_offline_to_online(self, parquet_path: str, feature_group_name: str, version: str = "v1", entity_key: str = "user_id", ttl_days: Optional[int] = None, batch_size: int = 1000) -> Dict[str, Any]:
         """
         Sync features from Parquet (offline) to Redis (online).
         
@@ -397,6 +392,170 @@ class FeatureStore:
                 "error": str(e)
             }
     
+    async def sync_from_supabase_async(
+        self,
+        database_url: str,
+        feature_group_name: str = "user_toxicity",
+        version: str = "prod",
+        entity_key: str = "user_id",
+        lookback_days: int = 30,
+        ttl_days: Optional[int] = 7,
+        batch_size: int = 1000
+    ) -> Dict[str, Any]:
+        """
+        Sync features directly from Supabase to Redis.
+        
+        This replaces reading from Parquet when you want real-time features.
+        
+        Args:
+            database_url: Supabase connection string
+            feature_group_name: Logical name for feature group
+            version: Feature version
+            entity_key: Entity column (user_id)
+            lookback_days: How far back to fetch user history
+            ttl_days: Redis key expiration
+            batch_size: Records per batch
+        
+        Returns:
+            Sync statistics
+        """
+        logger.info(f"🔄 Syncing from Supabase → Redis")
+        logger.info(f"   Feature Group: {feature_group_name}, Version: {version}")
+        
+        sync_start = datetime.now()
+        cutoff = sync_start - timedelta(days=lookback_days)
+        
+        try:
+            # Connect to Supabase
+            conn = await asyncpg.connect(database_url)
+            
+            # Query aggregated user features
+            query = """
+                WITH user_stats AS (
+                    SELECT 
+                        user_id,
+                        COUNT(*) FILTER (WHERE severity IN ('LOW', 'MEDIUM', 'HIGH')) as violation_count_7d,
+                        COUNT(*) as total_messages_7d,
+                        AVG(CASE WHEN severity IN ('LOW', 'MEDIUM', 'HIGH') THEN 1 ELSE 0 END) as user_bad_ratio_7d,
+                        MAX(timestamp) as last_message_time,
+                        MIN(timestamp) as first_message_time
+                    FROM logs
+                    WHERE timestamp > $1
+                    GROUP BY user_id
+                )
+                SELECT 
+                    user_id,
+                    violation_count_7d,
+                    total_messages_7d,
+                    user_bad_ratio_7d,
+                    EXTRACT(EPOCH FROM (NOW() - last_message_time)) / 3600.0 as hours_since_last_msg,
+                    EXTRACT(EPOCH FROM (NOW() - first_message_time)) / 86400.0 as account_age_days
+                FROM user_stats
+                WHERE total_messages_7d >= 3
+            """
+            
+            rows = await conn.fetch(query, cutoff)
+            await conn.close()
+            
+            logger.info(f"📥 Fetched {len(rows)} users from Supabase")
+            
+            # Stats
+            stats = {
+                "total_records": len(rows),
+                "feature_group": feature_group_name,
+                "version": version,
+                "started_at": sync_start.isoformat(),
+                "synced_records": 0,
+                "failed_records": 0,
+                "errors": []
+            }
+            
+            # Sync to Redis using pipeline
+            pipe = self.redis.pipeline()
+            batch_count = 0
+            
+            for row in rows:
+                try:
+                    entity_id = str(row['user_id'])
+                    redis_key = f"{feature_group_name}:{version}:{entity_id}"
+                    
+                    # Build feature dict (exclude user_id)
+                    features = {
+                        k: v for k, v in dict(row).items() 
+                        if k != 'user_id'
+                    }
+                    
+                    # Serialize and store
+                    typed_features = self._serialize_features(features)
+                    pipe.hset(redis_key, mapping=typed_features)
+                    
+                    # Set TTL
+                    if ttl_days:
+                        pipe.expire(redis_key, ttl_days * 86400)
+                    
+                    batch_count += 1
+                    stats["synced_records"] += 1
+                    
+                    # Execute batch
+                    if batch_count >= batch_size:
+                        pipe.execute()
+                        batch_count = 0
+                        
+                        if stats["synced_records"] % 5000 == 0:
+                            logger.info(f"   Synced {stats['synced_records']} users...")
+                
+                except Exception as e:
+                    error_msg = f"Failed to sync user {row.get('user_id')}: {e}"
+                    logger.warning(error_msg)
+                    stats["failed_records"] += 1
+                    stats["errors"].append(error_msg)
+            
+            # Execute remaining
+            if batch_count > 0:
+                pipe.execute()
+            
+            # Finalize
+            sync_duration = (datetime.now() - sync_start).total_seconds()
+            stats["completed_at"] = datetime.now().isoformat()
+            stats["duration_seconds"] = round(sync_duration, 2)
+            stats["records_per_second"] = round(stats["synced_records"] / sync_duration, 2)
+            
+            logger.info(
+                f"✅ Sync complete: {stats['synced_records']} users in {sync_duration:.2f}s "
+                f"({stats['records_per_second']:.2f} rec/s)"
+            )
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"❌ Supabase sync failed: {e}", exc_info=True)
+            raise FeatureStoreError(f"Supabase sync failed: {e}")
+    
+    def sync_from_supabase(
+        self,
+        database_url: str,
+        feature_group_name: str = "user_toxicity",
+        version: str = "prod",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Synchronous wrapper for async Supabase sync.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            return loop.run_until_complete(
+                self.sync_from_supabase_async(
+                    database_url=database_url,
+                    feature_group_name=feature_group_name,
+                    version=version,
+                    **kwargs
+                )
+            )
+        finally:
+            loop.close()
+
     def close(self):
         """Close Redis connection pool"""
         if self.redis:
@@ -415,35 +574,28 @@ if __name__ == "__main__":
     parser.add_argument("--redis-host", type=str, default="localhost")
     parser.add_argument("--redis-port", type=int, default=6379)
     parser.add_argument("--ttl-days", type=int, help="TTL in days")
-    
+
     args = parser.parse_args()
-    
-    # Setup logging
     logging.basicConfig(level=logging.INFO)
     
-    # Initialize Feature Store
-    fs = FeatureStore(redis_host=args.redis_host, redis_port=args.redis_port)
+    
+    fs = FeatureStore(redis_host=os.getenv('REDIS_HOST'), redis_port=os.getenv("REDIS_PORT"))
+
+    try:
+        sync_stats = fs.sync_from_supabase(
+            database_url=os.getenv('DATABASE_URL'),
+            feature_group_name="user_toxicity",
+            version="prod",
+            lookback_days=30, 
+            ttl_days=7        
+        )
+        
+        logger.info(f"✅ Synced {sync_stats['synced_records']} user features to Redis")
+    except Exception as e:
+        logger.error(f"⚠️ Feature sync failed: {e}")
     
     if args.sync:
         if not args.parquet:
-            print("Error: --parquet required for sync operation")
+            print("Error: --parquet required")
             exit(1)
-        
-        stats = fs.sync_offline_to_online(
-            parquet_path=args.parquet,
-            feature_group_name=args.feature_group,
-            version=args.version,
-            ttl_days=args.ttl_days
-        )
-        
-        print(f"\n✅ Sync completed:")
-        print(f"  - Total records: {stats['total_records']}")
-        print(f"  - Synced: {stats['synced_records']}")
-        print(f"  - Failed: {stats['failed_records']}")
-        print(f"  - Duration: {stats['duration_seconds']}s")
-        print(f"  - Throughput: {stats['records_per_second']} rec/s")
-    else:
-        health = fs.health_check()
-        print(f"\nRedis Health: {health}")
-    
-    fs.close()
+        fs.sync_from_supabase(args.parquet, "user_toxicity", "prod", 7)

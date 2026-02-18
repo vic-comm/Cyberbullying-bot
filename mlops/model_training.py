@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
 from dataclasses import dataclass
 from enum import Enum
-
+import hashlib
 import pandas as pd
 import numpy as np
 import torch
@@ -14,18 +14,15 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics import (
-    fbeta_score, classification_report, precision_score, 
+    fbeta_score, precision_score, 
     recall_score, roc_auc_score, confusion_matrix, accuracy_score,
     ConfusionMatrixDisplay, average_precision_score
 )
 from sklearn.linear_model import LogisticRegression
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
-
+from mlops.utils import compute_text_hash
 import mlflow
-import mlflow.sklearn
-import mlflow.xgboost
-import mlflow.lightgbm
 from mlflow.models.signature import infer_signature
 from mlflow.tracking import MlflowClient
 import mlflow.pyfunc
@@ -259,60 +256,169 @@ class DataPreparator:
         
         return df
     
+    def _compute_text_hashes(self, text_series: pd.Series) -> pd.Series:
+        import hashlib
+        # FIX: Use list comprehension instead of .apply()
+        return [hashlib.sha256(str(t).encode('utf-8')).hexdigest() for t in text_series]
+    
+    # def _get_embeddings(self, df: pd.DataFrame, force_recompute: bool) -> np.ndarray:
+    #     """Generate or load cached embeddings"""
+    #     from cache import EmbeddingCache
+        
+    #     print("\n2. Text Embeddings (DistilBERT)...")
+        
+    #     # Determine if we should use S3
+    #     local_cache_exists = (
+    #         (self.config.CACHE_DIR / 'bert_embeddings.pkl').exists() and
+    #         (self.config.CACHE_DIR / 'cache_metadata.json').exists()
+    #     )
+        
+    #     use_s3 = not local_cache_exists
+    #     s3_bucket = self.config.S3_BUCKET if use_s3 else None
+        
+    #     if local_cache_exists:
+    #         print("   📁 Local cache detected")
+    #     else:
+    #         print("   🪣 No local cache - will sync with S3")
+        
+    #     cache = EmbeddingCache(
+    #         cache_dir=str(self.config.CACHE_DIR),
+    #         s3_bucket=s3_bucket,
+    #         use_s3=use_s3,
+    #         s3_prefix="embeddings-cache"
+    #     )
+        
+    #     if not force_recompute:
+    #         try:
+    #             print("   -> Loading from cache...")
+    #             embeddings, metadata = cache.load_embeddings()
+    #             print(f"   ✅ Loaded {len(embeddings):,} cached embeddings")
+    #             return embeddings
+    #         except Exception as e:
+    #             print(f"   ⚠️  Cache load failed: {e}")
+    #             print("   -> Falling back to generation...")
+        
+    #     # Generate new embeddings
+    #     print("   -> Generating new embeddings...")
+    #     raw_text = df['text'].astype(str).tolist()
+    #     embeddings = self.embedding_generator.generate(raw_text)
+        
+    #     # Save to cache
+    #     try:
+    #         cache.save_embeddings(
+    #             embeddings,
+    #             str(self.config.DATA_PATH),
+    #             additional_info={'num_texts': len(raw_text)}
+    #         )
+    #         print("   ✅ Embeddings cached successfully")
+    #     except Exception as e:
+    #         print(f"   ⚠️  Failed to cache embeddings: {e}")
+        
+    #     return embeddings
+    
     def _get_embeddings(self, df: pd.DataFrame, force_recompute: bool) -> np.ndarray:
-        """Generate or load cached embeddings"""
+        """
+        Incremental Embedding Generation:
+        1. Load Master Dictionary (Hash -> Vector)
+        2. Identify new unique texts
+        3. Compute only new embeddings
+        4. Merge and Align
+        """
         from cache import EmbeddingCache
         
-        print("\n2. Text Embeddings (DistilBERT)...")
+        print("\n2. Text Embeddings (DistilBERT - Incremental)...")
         
-        # Determine if we should use S3
-        local_cache_exists = (
-            (self.config.CACHE_DIR / 'bert_embeddings.pkl').exists() and
-            (self.config.CACHE_DIR / 'cache_metadata.json').exists()
-        )
-        
+        # 1. Setup Cache Manager
+        local_cache_exists = (self.config.CACHE_DIR / 'embedding_store.pkl').exists()
         use_s3 = not local_cache_exists
         s3_bucket = self.config.S3_BUCKET if use_s3 else None
         
-        if local_cache_exists:
-            print("   📁 Local cache detected")
-        else:
-            print("   🪣 No local cache - will sync with S3")
-        
         cache = EmbeddingCache(
-            cache_dir=str(self.config.CACHE_DIR),
-            s3_bucket=s3_bucket,
             use_s3=use_s3,
-            s3_prefix="embeddings-cache"
+            cache_dir=str(self.config.CACHE_DIR),
+            s3_bucket=s3_bucket
         )
+        
+        # 2. Compute Hashes for Current Data
+        # We process unique texts only to save time (deduplication)
+        current_text_list = df['text'].astype(str).tolist()
+        current_hashes = self._compute_text_hashes(current_text_list)
+        
+        # 3. Load Existing Master Store (Dictionary)
+        master_store: Dict[str, np.ndarray] = {}
         
         if not force_recompute:
             try:
-                print("   -> Loading from cache...")
-                embeddings, metadata = cache.load_embeddings()
-                print(f"   ✅ Loaded {len(embeddings):,} cached embeddings")
-                return embeddings
+                # We use a specific filename for the dictionary store
+                store_data, _ = cache.load_embeddings(filename="embedding_store.pkl")
+                if isinstance(store_data, dict):
+                    master_store = store_data
+                    print(f"   ✅ Loaded Master Store with {len(master_store):,} embeddings")
+                else:
+                    print("   ⚠️  Cached file was not a dictionary. Starting fresh.")
+            except FileNotFoundError:
+                print("   New store. Starting fresh.")
             except Exception as e:
-                print(f"   ⚠️  Cache load failed: {e}")
-                print("   -> Falling back to generation...")
+                print(f"   ⚠️  Cache load failed ({e}). Starting fresh.")
         
-        # Generate new embeddings
-        print("   -> Generating new embeddings...")
-        raw_text = df['text'].astype(str).tolist()
-        embeddings = self.embedding_generator.generate(raw_text)
+        # 4. Identify the Delta (Missing Embeddings)
+        # Convert to set for O(1) lookups
+        existing_keys = set(master_store.keys())
+        # Find hashes in current data that aren't in the store
+        missing_hashes = [h for h in set(current_hashes) if h not in existing_keys]
         
-        # Save to cache
-        try:
-            cache.save_embeddings(
-                embeddings,
-                str(self.config.DATA_PATH),
-                additional_info={'num_texts': len(raw_text)}
-            )
-            print("   ✅ Embeddings cached successfully")
-        except Exception as e:
-            print(f"   ⚠️  Failed to cache embeddings: {e}")
+        if not missing_hashes:
+            print("   ✅ No new data detected. Using 100% cached embeddings.")
+        else:
+            print(f"   ⚡ Found {len(missing_hashes):,} new unique texts to compute.")
+            
+            # Get the actual text content for the missing hashes
+            # We create a map of hash -> text to retrieve them
+            # (Using a dict comprehension ensures we get one text per unique hash)
+            hash_to_text = {h: t for h, t in zip(current_hashes, current_text_list) if h in missing_hashes}
+            texts_to_compute = list(hash_to_text.values())
+            hashes_to_compute = list(hash_to_text.keys())
+            
+            # 5. Compute New Embeddings
+            new_embeddings = self.embedding_generator.generate(texts_to_compute)
+            
+            # 6. Update Master Store
+            for h, emb in zip(hashes_to_compute, new_embeddings):
+                master_store[h] = emb
+                
+            print(f"   ✅ Merged {len(new_embeddings)} new embeddings into Master Store")
+            
+            # 7. Save Updated Master Store
+            try:
+                cache.save_embeddings(
+                    master_store, 
+                    str(self.config.DATA_PATH), 
+                    filename="embedding_store.pkl",
+                    additional_info={'total_unique_texts': len(master_store)}
+                )
+            except Exception as e:
+                print(f"   ⚠️  Failed to save updated store: {e}")
+
+        # 8. Align & Reconstruct Matrix
+        # We must return an array that matches the EXACT order of 'df'
+        print("   -> Aligning embeddings to current dataframe...")
         
-        return embeddings
+        # Pre-allocate array (N_samples x 768)
+        embedding_dim = 768
+        final_embeddings = np.zeros((len(df), embedding_dim), dtype=np.float32)
+        
+        missing_count = 0
+        for idx, h in enumerate(current_hashes):
+            if h in master_store:
+                final_embeddings[idx] = master_store[h]
+            else:
+                # Should not happen if logic above is correct
+                missing_count += 1
+        
+        if missing_count > 0:
+            print(f"   ❌ CRITICAL: {missing_count} embeddings missing after update!")
+        
+        return final_embeddings
     
     def _reduce_dimensions(self, embeddings: np.ndarray) -> Tuple[np.ndarray, TruncatedSVD]:
         """Apply dimensionality reduction"""
@@ -888,7 +994,7 @@ class ModelTrainer:
             pip_requirements=base_requirements
         )
 
-@task(log_prints=True)
+# @task(log_prints=True)
 def run_all_experiments(data: TrainingData, n_trials: int = 50, models_to_train: Optional[List[ModelType]] = None) -> Tuple[str, str, float, str]:
     if models_to_train is None:
         models_to_train = list(ModelType)
@@ -935,7 +1041,7 @@ def run_all_experiments(data: TrainingData, n_trials: int = 50, models_to_train:
 
 
 # MODEL PROMOTION
-@task(log_prints=True)
+# @task(log_prints=True)
 def promote_best_model(winner_id: str, winner_uuid: str, winner_f2: float, winner_name: str, client: MlflowClient, experiment_name: str = "cyberbullying-detection") -> int:
     """
     Promote best model to production in registry

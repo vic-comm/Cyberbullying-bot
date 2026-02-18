@@ -1,0 +1,46 @@
+{
+  "pipeline_metadata": {
+    "start_time": "2026-02-09T17:56:39.042814",
+    "end_time": "2026-02-09T17:57:09.841690",
+    "duration_seconds": 30.798876,
+    "pipeline_version": "1.0.0",
+    "mlflow_run_id": "ac0e095985db4fa39978f789eeda818c",
+    "mlflow_experiment": "Drift_Monitoring_v3"
+  },
+  "decision": {
+    "timestamp": "2026-02-09T16:57:07.542368",
+    "drift_detected": false,
+    "severity": "none",
+    "action": "no_action_needed",
+    "metrics": {
+      "combined_drift_share": 0.0,
+      "statistical_drift_share": 0.0,
+      "evidently_drift_share": 0.0,
+      "total_drifted_features": 0,
+      "label_drift_detected": false
+    },
+    "drifted_features": {
+      "all": [],
+      "statistical_only": [],
+      "evidently_only": [],
+      "both": []
+    }
+  },
+  "statistical": {
+    "timestamp": "2026-02-09T17:56:45.810204",
+    "reference_samples": 207954,
+    "current_samples": 34,
+    "features": {},
+    "overall_drift_detected": false,
+    "drifted_features": [],
+    "drift_share": 0.0
+  },
+  "evidently": {
+    "drift_share": 0.0,
+    "drifted_features": [],
+    "drifted_count": 0,
+    "dataset_drift_detected": false,
+    "report_path": "reports/drift_report.html",
+    "timestamp": "2026-02-09T17:57:01.991901"
+  }
+}

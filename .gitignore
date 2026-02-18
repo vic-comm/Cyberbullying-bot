@@ -10,7 +10,7 @@ data/*.json
 data/*.parquet
 data/*.db
 
-
+*.db
 # IDE
 .vscode/
 .idea/

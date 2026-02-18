@@ -1,6 +1,0 @@
-artifact_location: s3://cyberbullying-artifacts-victor-obi/mlflow
-creation_time: 1770035756376
-experiment_id: '138410636173462509'
-last_update_time: 1770035756376
-lifecycle_stage: active
-name: cyberbullying-detection

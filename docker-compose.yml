@@ -1,60 +1,160 @@
+# version: '3.8'
+
+# services:
+#   redis:
+#     image: redis:alpha
+#     container_name: bully-redis
+#     ports:
+#       - "6379:6379"
+#     restart: always
+
+#   api:
+#     build:
+#       context: .
+#       dockerfile: api_service/Dockerfile
+#     container_name: bully-api
+#     ports:
+#       - "8000:8000"
+#     environment:
+#       - MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI}
+#       - REDIS_HOST=redis  
+#       - REDIS_PORT=6379
+#       - MODEL_STAGE=Production
+#       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+#       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+#     depends_on:
+#       - redis
+
+#   bot:
+#     build:
+#       context: .
+#       dockerfile: bot/Dockerfile
+#     container_name: bully-bot
+#     environment:
+#       - DISCORD_TOKEN=${DISCORD_TOKEN}
+#       - API_BASE_URL=http://api:8000
+#     depends_on:
+#       - api
+#     restart: always
+
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: bully-prometheus
+  #   volumes:
+  #     - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+  #   ports:
+  #     - "9090:9090"
+  #   depends_on:
+  #     - api
+  #   restart: always
+
+  # grafana:
+  #   image: grafana/grafana:latest
+  #   container_name: bully-grafana
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - GF_SECURITY_ADMIN_PASSWORD=admin
+  #   depends_on:
+  #     - prometheus
+  #   restart: always
+
+
+# version: '3.8'
+
+# services:
+#   # Service A: The Discord Bot
+#   bot:
+#     build: ./bot_service
+#     container_name: cyberbullying_bot
+#     restart: always
+#     environment:
+#       - BOT_DB_PATH=/app/data/bot_memory.db  # Point to the shared folder
+#     volumes:
+#       # MAP HOST FOLDER -> CONTAINER FOLDER
+#       - ./production_data:/app/data
+
+#   # Service B: The ML Pipeline (Prefect)
+#   mlops:
+#     build: ./mlops
+#     container_name: mlops_pipeline
+#     restart: on-failure
+#     environment:
+#       - BOT_DB_PATH=/app/data/bot_memory.db   # Same path!
+#       - LOGS_PATH=/app/data/raw_logs.jsonl    # Same path!
+#       - MASTER_DATA_PATH=/app/data/training_data.parquet
+#     volumes:
+#       # MAP THE SAME HOST FOLDER
+#       - ./production_data:/app/data
+#       # (Optional) Map models if they are shared
+#       - ./models:/app/models
+
+# volumes:
+#   production_data:
+
 version: '3.8'
 
-services:
-  redis:
-    image: redis:alpha
-    container_name: bully-redis
-    ports:
-      - "6379:6379"
-    restart: always
+networks:
+  app_network:
+    driver: bridge
 
+services:
   api:
+    container_name: cyberbullying-api
     build:
       context: .
       dockerfile: api_service/Dockerfile
-    container_name: bully-api
+    image: cyberbullying-api:latest
     ports:
       - "8000:8000"
+    networks:
+      - app_network
+    env_file: .env
     environment:
-      - MLFLOW_TRACKING_URI=${MLFLOW_TRACKING_URI}
-      - REDIS_HOST=redis  
-      - REDIS_PORT=6379
-      - MODEL_STAGE=Production
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-    depends_on:
-      - redis
-
+      - MODEL_LOCAL_PATH=/app/baked_model
+      - BAKED_BERT_PATH=/app/baked_bert
+      - TRANSFORMERS_OFFLINE=1
+      - LOGS_PATH=/app/data/raw_logs.jsonl
+    volumes:
+      - ./baked_model:/app/baked_model
+      - ./baked_bert:/app/baked_bert
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s 
+    restart: unless-stopped
   bot:
+    container_name: cyberbullying-bot
     build:
       context: .
-      dockerfile: bot/Dockerfile
-    container_name: bully-bot
-    environment:
-      - DISCORD_TOKEN=${DISCORD_TOKEN}
-      - API_BASE_URL=http://api:8000
+      dockerfile: bot_service/Dockerfile
+    image: cyberbullying-bot:latest
+    networks:
+      - app_network
     depends_on:
-      - api
-    restart: always
-
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: bully-prometheus
+      api:
+        condition: service_healthy 
+    env_file: .env
+    environment:
+      - BASE_URL=http://api:8000 
+      - DB_PATH=/app/data/bot_memory.db
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
-    ports:
-      - "9090:9090"
-    depends_on:
-      - api
-    restart: always
+      - ./bot_data:/app/data
+    restart: unless-stopped
 
-  grafana:
-    image: grafana/grafana:latest
-    container_name: bully-grafana
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    depends_on:
-      - prometheus
-    restart: always
+  mlops-worker:
+    container_name: mlops-worker
+    build:
+      context: .
+      dockerfile: mlops/Dockerfile
+    image: mlops-worker:latest
+    networks:
+      - app_network
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+    profiles: ["tools"]

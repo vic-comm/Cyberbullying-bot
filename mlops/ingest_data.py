@@ -8,17 +8,22 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 from .utils import calculate_text_features
+import asyncio
 from prefect import task, flow
-from prefect.deployments import Deployment
-from prefect.server.schemas.schedules import IntervalSchedule
-
+import asyncpg
+from mlops.feature_store import FeatureStore
 # CONFIGURATION
-LOGS_PATH = os.getenv("LOGS_PATH", "../data/raw_logs.jsonl")
-MASTER_DATA_PATH = os.getenv("MASTER_DATA_PATH", "../data/training_data_with_history.parquet")
-BACKUP_PATH = os.getenv("BACKUP_PATH", "../data/training_data_backup.parquet")
-ARCHIVE_PATH = os.getenv("ARCHIVE_PATH", "../data/archives")
-FEATURE_CONFIG_PATH = os.getenv("FEATURE_CONFIG", "../config/features.json")
-
+import boto3
+LOGS_PATH = os.getenv("LOGS_PATH", "data/raw_logs.jsonl")
+MASTER_DATA_PATH = os.getenv("MASTER_DATA_PATH", "data/training_data_with_history.parquet")
+BACKUP_PATH = os.getenv("BACKUP_PATH", "data/training_data_backup.parquet")
+ARCHIVE_PATH = os.getenv("ARCHIVE_PATH", "data/archives")
+FEATURE_CONFIG_PATH = os.getenv("FEATURE_CONFIG", "config/features.json")
+BUCKET_NAME = os.getenv("BUCKET_NAME") 
+S3_MASTER_KEY = os.getenv("S3_MASTER_KEY", "data/training_data_with_history.parquet")
+DATABASE_URL = os.getenv("DATABASE_URL")
+INGESTION_LOOKBACK_HOURS = int(os.getenv("INGESTION_LOOKBACK_HOURS", "24")) 
+PLATFORMS_TO_INGEST = os.getenv("PLATFORMS_TO_INGEST", "discord,slack,whatsapp").split(",")
 # Data quality thresholds
 MIN_TEXT_LENGTH = 3
 MAX_TEXT_LENGTH = 5000
@@ -32,104 +37,143 @@ TOXIC_KEYWORDS = {
     'harassment': ['ugly', 'fat', 'worthless', 'pathetic', 'waste']
 }
 
-# Setup logging
+LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs')
+LOG_FILE = os.path.join(LOG_DIR, 'ingestion.log')
+
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(FEATURE_CONFIG_PATH, exist_ok=True)
+os.makedirs(ARCHIVE_PATH, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('../logs/ingestion.log'),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
+async def fetch_logs_from_supabase(
+    lookback_hours: int = 24,
+    platforms: List[str] = None
+) -> Optional[pd.DataFrame]:
+    """
+    Fetch recent logs from Supabase for training data ingestion.
+    
+    Replaces reading from JSONL files - now queries PostgreSQL directly.
+    """
+    if not DATABASE_URL:
+        logger.error("❌ DATABASE_URL not set - cannot fetch logs")
+        return None
+    
+    platforms = platforms or PLATFORMS_TO_INGEST
+    cutoff = datetime.now() - timedelta(hours=lookback_hours)
+    
+    logger.info(f"📂 Fetching logs from Supabase...")
+    logger.info(f"   Platforms: {platforms}")
+    logger.info(f"   Since: {cutoff.isoformat()}")
+    
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        
+        # Query logs with quality filters
+        query = """
+            SELECT 
+                l.id,
+                l.user_id,
+                l.server_id,
+                l.platform,
+                l.message as text,
+                l.toxicity_score,
+                l.severity,
+                l.action_taken,
+                l.timestamp,
+                l.explanation,
+                l.metadata
+            FROM logs l
+            WHERE l.timestamp > $1
+              AND l.platform = ANY($2)
+              AND l.toxicity_score IS NOT NULL
+              AND l.severity IS NOT NULL
+              AND LENGTH(l.message) >= $3
+              AND LENGTH(l.message) <= $4
+            ORDER BY l.timestamp DESC
+        """
+        
+        rows = await conn.fetch(
+            query,
+            cutoff,
+            platforms,
+            MIN_TEXT_LENGTH,
+            MAX_TEXT_LENGTH
+        )
+        
+        await conn.close()
+        
+        if not rows:
+            logger.warning("⚠️ No logs found in specified time window")
+            return None
+        
+        # Convert to DataFrame
+        df = pd.DataFrame([dict(row) for row in rows])
+        
+        logger.info(f"✅ Fetched {len(df)} logs from database")
+        
+        # Create label from severity
+        severity_to_label = {
+            'SAFE': 0,
+            'UNCERTAIN': 0,
+            'LOW': 1,
+            'MEDIUM': 1,
+            'HIGH': 1
+        }
+        
+        df['label'] = df['severity'].map(severity_to_label)
+        df['label_source'] = 'production'  # From actual bot decisions
+        
+        # Add text hash for deduplication
+        df['text_hash'] = df['text'].apply(lambda x: hash(x))
+        
+        # Platform distribution
+        platform_dist = df['platform'].value_counts()
+        logger.info(f"   Platform distribution: {platform_dist.to_dict()}")
+        
+        return df
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch logs from Supabase: {e}", exc_info=True)
+        return None
+
 # DATA LOADING AND VALIDATION
 @task(name="Load and Validate Logs", log_prints=True, retries=2, retry_delay_seconds=30)
 def load_and_validate_logs() -> Optional[pd.DataFrame]:
-    if not os.path.exists(LOGS_PATH):
-        logger.warning(f"⚠️  No logs found at {LOGS_PATH}")
-        return None
+    """
+    Load logs from Supabase (replaces JSONL loading).
+    """
+    logger.info(f"📂 Loading logs from Supabase (last {INGESTION_LOOKBACK_HOURS}h)...")
     
-    # Check file size
-    file_size = os.path.getsize(LOGS_PATH)
-    if file_size == 0:
-        logger.warning("⚠️  Log file is empty")
-        return None
-    
-    logger.info(f"📂 Loading logs from {LOGS_PATH} ({file_size} bytes)")
+    # Run async fetch in sync context
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
     try:
-        # Read JSONL with error handling
-        new_data = pd.read_json(LOGS_PATH, lines=True)
-        
-        if new_data.empty:
-            logger.warning("⚠️  No data in log file")
-            return None
-        
-        logger.info(f"✅ Loaded {len(new_data)} raw records")
-        
-        # Validate required columns
-        required_cols = ['text', 'user_id', 'timestamp']
-        missing_cols = [col for col in required_cols if col not in new_data.columns]
-        
-        if missing_cols:
-            logger.error(f"❌ Missing required columns: {missing_cols}")
-            return None
-        
-        # Filter by text length
-        new_data = new_data[
-            (new_data['text'].str.len() >= MIN_TEXT_LENGTH) &
-            (new_data['text'].str.len() <= MAX_TEXT_LENGTH)
-        ].copy()
-        
-        logger.info(f"✅ {len(new_data)} records after length filtering")
-        
-        # Determine label source
-        if 'verified_label' in new_data.columns:
-            # Use human labels (highest quality)
-            valid_data = new_data[new_data['verified_label'].notna()].copy()
-            valid_data['label'] = valid_data['verified_label'].astype(int)
-            valid_data['label_source'] = 'human'
-            logger.info(f"✅ Using {len(valid_data)} human-verified labels")
-            
-        elif 'prediction' in new_data.columns:
-            # Use model predictions (pseudo-labeling)
-            valid_data = new_data[new_data['prediction'].notna()].copy()
-            valid_data['label'] = valid_data['prediction'].astype(int)
-            valid_data['label_source'] = 'model'
-            logger.warning(f"⚠️  Using {len(valid_data)} model predictions as pseudo-labels")
-            
-        else:
-            logger.error("❌ No label column found (need 'verified_label' or 'prediction')")
-            return None
-        
-        if len(valid_data) < MIN_NEW_SAMPLES:
-            logger.warning(f"⚠️  Only {len(valid_data)} samples (minimum: {MIN_NEW_SAMPLES})")
-            return None
-        
-        # Add metadata
-        valid_data['ingested_at'] = datetime.now().isoformat()
-        
-        # Check for nulls
-        null_ratio = valid_data.isnull().mean().mean()
-        if null_ratio > MAX_NULL_RATIO:
-            logger.warning(f"⚠️  High null ratio: {null_ratio:.2%} (threshold: {MAX_NULL_RATIO:.2%})")
-        
-        # Deduplicate by text hash
-        if 'text_hash' in valid_data.columns:
-            before = len(valid_data)
-            valid_data = valid_data.drop_duplicates(subset=['text_hash'])
-            after = len(valid_data)
-            if before != after:
-                logger.info(f"🔄 Removed {before - after} duplicate samples")
-        
-        logger.info(f"✅ Validated {len(valid_data)} samples ready for ingestion")
-        
-        return valid_data
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to load logs: {e}", exc_info=True)
+        df = loop.run_until_complete(
+            fetch_logs_from_supabase(
+                lookback_hours=INGESTION_LOOKBACK_HOURS,
+                platforms=PLATFORMS_TO_INGEST
+            )
+        )
+    finally:
+        loop.close()
+    
+    if df is None or df.empty:
+        logger.warning("⚠️ No data available for ingestion")
         return None
+    
+    logger.info(f"✅ Loaded {len(df)} raw records from database")
+    
+    # Validate data quality
+    return validate_incoming_data(df)
 
 # FEATURE ENGINEERING
 @task(name="Calculate Features", log_prints=True)
@@ -147,7 +191,24 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
    
     df = pd.concat([df.reset_index(drop=True), feature_df.reset_index(drop=True)], axis=1)
     
-   
+    def extract_metadata_features(row):
+        meta = row.get('metadata')
+        if not isinstance(meta, dict):
+            return pd.Series()
+        
+        # Extract specific features logged by the bot
+        return pd.Series({
+            'user_bad_ratio_7d': meta.get('user_bad_ratio_7d', 0.0),
+            'user_toxicity_trend': meta.get('user_toxicity_trend', 0.0),
+            'channel_toxicity_ratio': meta.get('channel_toxicity_ratio', 0.0),
+            'is_new_to_channel': int(meta.get('is_new_to_channel', 0))
+        })
+
+    # Apply extraction
+    if 'metadata' in df.columns:
+        meta_features = df.apply(extract_metadata_features, axis=1)
+        df = pd.concat([df, meta_features], axis=1)
+        
     history_features = [
         'user_bad_ratio_7d',
         'user_bad_ratio_30d',
@@ -193,283 +254,262 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# DATA QUALITY CHECKS
-@task(name="Validate Data Quality",log_prints=True)
+@task(name="Validate Data Quality", log_prints=True)
 def validate_data_quality(df: pd.DataFrame) -> bool:
-    logger.info("🔍 Running data quality checks...")
+    """
+    Acts as a quality gate. 
+    Returns False (BLOCKING) for Broken Pipelines or Attacks.
+    Returns True (WARNING) for Class Imbalance or Concept Drift.
+    """
+    logger.info("🔍 Running strict data quality checks...")
     
-    issues = []
+    blocking_issues = []
+    warnings = []
     
-    # Check label distribution
-    label_dist = df['label'].value_counts(normalize=True)
-    logger.info(f"Label distribution:\n{label_dist}")
-    
-    minority_class_ratio = label_dist.min()
-    if minority_class_ratio < 0.1:
-        issues.append(f"Severe class imbalance: minority class at {minority_class_ratio:.2%}")
-    
+    # ── 1. CRITICAL: DATA QUALITY DRIFT (Broken Pipeline) ────────────────
+    # Check A: Essential Columns are Missing/Null
+    critical_cols = ['text', 'user_id', 'timestamp']
+    for col in critical_cols:
+        if col not in df.columns:
+            blocking_issues.append(f"❌ Missing critical column: {col}")
+        elif df[col].isnull().any():
+            null_count = df[col].isnull().sum()
+            blocking_issues.append(f"❌ Nulls found in critical column '{col}': {null_count} rows")
+
+    # Check B: Text Content Integrity (Empty strings or whitespace)
+    if 'text' in df.columns:
+        empty_text_count = df[df['text'].str.strip() == ''].shape[0]
+        if empty_text_count > 0:
+            blocking_issues.append(f"❌ Found {empty_text_count} rows with empty/whitespace text")
+
+    # Check C: Message Length Corruption (e.g., all 0s)
+    if 'msg_len' in df.columns:
+        if (df['msg_len'] == 0).all():
+             blocking_issues.append("❌ Critical: 'msg_len' is 0 for ALL rows (Pipeline bug?)")
+
+    # Check D: Spam/Repetition Attack (Identical content spam)
+    # If >50% of the dataset is duplicates of the same 1 message
+    if 'text' in df.columns and len(df) > 50:
+        most_common_msg = df['text'].mode()[0]
+        repetition_count = (df['text'] == most_common_msg).sum()
+        repetition_rate = repetition_count / len(df)
+        
+        if repetition_rate > 0.5:  # Threshold: 50% identical messages
+            blocking_issues.append(f"❌ ADVERSARIAL ATTACK DETECTED: {repetition_rate:.1%} of data is identical spam.")
+            logger.error(f"   Spam content sample: '{most_common_msg[:50]}...'")
+
+    # Check E: Bot/Script Flooding (One user sending >30% of all data)
+    if 'user_id' in df.columns and len(df) > 50:
+        top_user_share = df['user_id'].value_counts(normalize=True).iloc[0]
+        if top_user_share > 0.3: # Threshold: 1 user sent 30% of batch
+            blocking_issues.append(f"❌ ADVERSARIAL ATTACK: Single user sent {top_user_share:.1%} of all messages.")
+
+    # Check F: Class Imbalance (Warning only)
+    if 'label' in df.columns:
+        label_dist = df['label'].value_counts(normalize=True)
+        minority_class_ratio = label_dist.min()
+        if minority_class_ratio < 0.05: # Stricter 5%
+            warnings.append(f"⚠️ Severe class imbalance: Minority class at {minority_class_ratio:.2%}")
+
+    # Check G: High Nulls in Non-Critical Features
     null_counts = df.isnull().sum()
     high_null_features = null_counts[null_counts > len(df) * 0.2]
-    
+    high_null_features = high_null_features.drop(labels=critical_cols, errors='ignore') # Ignore criticals already checked
     if not high_null_features.empty:
-        issues.append(f"Features with >20% nulls: {list(high_null_features.index)}")
+        warnings.append(f"⚠️ High nulls in features: {list(high_null_features.index)}")
     
-    # Check for constant features
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    constant_features = [col for col in numeric_cols if df[col].nunique() == 1]
-    
-    if constant_features:
-        issues.append(f"Constant features (no variance): {constant_features}")
-    
-    # Check for outliers in key features
-    key_features = ['msg_len', 'caps_ratio', 'slur_count']
-    for feature in key_features:
-        if feature in df.columns:
-            q99 = df[feature].quantile(0.99)
-            outliers = (df[feature] > q99).sum()
-            if outliers > len(df) * 0.05:
-                logger.warning(f"⚠️  {feature}: {outliers} outliers (>{q99:.2f})")
-    
-    # Report issues
-    if issues:
-        logger.warning(f"⚠️  Data quality issues found:")
-        for issue in issues:
-            logger.warning(f"  - {issue}")
-        
-        # Decide whether to proceed
-        # For now, we proceed with warnings but this could be a hard stop
-        return True
-    else:
-        logger.info(" All data quality checks passed")
-        return True
+    # Print Warnings (Don't stop)
+    for w in warnings:
+        logger.warning(w)
 
-# DATA MERGING
-@task(name="Merge and Save", log_prints=True, retries=2)
-def merge_and_save(new_df: Optional[pd.DataFrame]) -> Dict[str, Any]:
-    if new_df is None or new_df.empty:
-        logger.warning("  No new data to merge")
-        return {"status": "skipped", "reason": "no_new_data"}
-    
-    stats = {
-        "new_samples": len(new_df),
-        "merge_timestamp": datetime.now().isoformat()
-    }
+    # Print Blocking Issues (STOP PIPELINE)
+    if blocking_issues:
+        logger.error("🛑 CRITICAL DATA QUALITY FAILURE - INGESTION ABORTED")
+        for issue in blocking_issues:
+            logger.error(issue)
+        return False  # BLOCK INGESTION
+
+    logger.info("✅ Data Quality & Adversarial Checks Passed")
+    return True   # ALLOW INGESTION
+
+def pull_master_data():
+    if os.path.exists(MASTER_DATA_PATH):
+        logger.info("✅ Master data already exists locally.")
+        return
+
+    logger.info("📉 Pulling Master Data (Remote -> Local)...")
     
     try:
-        # Load master dataset
+        subprocess.run(["dvc", "pull", MASTER_DATA_PATH, "--force"], check=True, capture_output=True)
+        logger.info("✅ DVC Pull successful")
+        return
+    except Exception as e:
+        logger.warning(f"⚠️ DVC Pull failed: {e}")
+
+    if BUCKET_NAME:
+        try:
+            logger.info("🔄 Attempting direct S3 download...")
+            s3 = boto3.client('s3')
+            os.makedirs(os.path.dirname(MASTER_DATA_PATH), exist_ok=True)
+            s3.download_file(BUCKET_NAME, S3_MASTER_KEY, MASTER_DATA_PATH)
+            logger.info("✅ Direct S3 Download successful")
+        except Exception as e:
+            logger.warning(f"❌ Direct S3 Download failed: {e}")
+
+def push_master_data():
+    logger.info("📈 Pushing Master Data (Local -> Remote)...")
+    
+    try:
+        subprocess.run(["dvc", "add", MASTER_DATA_PATH], check=True, capture_output=True)
+        subprocess.run(["dvc", "push", MASTER_DATA_PATH], check=True, capture_output=True)
+        logger.info("✅ DVC Push successful")
+        return
+    except Exception as e:
+        logger.warning(f"⚠️ DVC Push failed: {e}")
+
+    if BUCKET_NAME:
+        try:
+            logger.info("🔄 Attempting direct S3 upload...")
+            s3 = boto3.client('s3')
+            s3.upload_file(MASTER_DATA_PATH, BUCKET_NAME, S3_MASTER_KEY)
+            logger.info("✅ Direct S3 Upload successful")
+        except Exception as e:
+            logger.error(f"❌ Direct S3 Upload failed: {e}")
+
+
+def merge_and_save(new_df: pd.DataFrame) -> Dict[str, Any]:
+    stats = {"new_samples": len(new_df), "status": "pending"}
+    
+    try:
+        # A. DOWNLOAD HISTORY
+        pull_master_data()
+        
+        # B. LOAD
         if os.path.exists(MASTER_DATA_PATH):
-            logger.info(f" Loading master dataset from {MASTER_DATA_PATH}")
             master_df = pd.read_parquet(MASTER_DATA_PATH)
             stats["master_size_before"] = len(master_df)
-            logger.info(f" Loaded {len(master_df)} existing samples")
         else:
-            logger.warning(f"  No master dataset found, creating new one")
             master_df = pd.DataFrame()
             stats["master_size_before"] = 0
-        
-        # Align columns
-        if not master_df.empty:
-            # Get common columns
-            common_cols = list(set(master_df.columns) & set(new_df.columns))
             
-            # Add missing columns to new_df with defaults
+        # C. ALIGN COLUMNS (Fix mismatch errors)
+        if not master_df.empty:
             for col in master_df.columns:
                 if col not in new_df.columns:
-                    if master_df[col].dtype == 'object':
-                        new_df[col] = None
-                    else:
-                        new_df[col] = 0
-            
-            # Align column order
-            new_df = new_df[master_df.columns]
-        
-        # Merge
+                    new_df[col] = 0 if pd.api.types.is_numeric_dtype(master_df[col]) else None
+            new_df = new_df[master_df.columns.intersection(new_df.columns)]
+
+        # D. MERGE
         combined_df = pd.concat([master_df, new_df], ignore_index=True)
         
-        # Deduplicate
+        # E. DEDUPLICATE (Critical step)
+        # Drop duplicates based on hash, keep the LAST (newest) one
         if 'text_hash' in combined_df.columns:
-            dedup_col = 'text_hash'
-        else:
-            dedup_col = ['text', 'user_id', 'timestamp']
-        
-        before_dedup = len(combined_df)
-        combined_df = combined_df.drop_duplicates(subset=dedup_col, keep='last')
-        after_dedup = len(combined_df)
-        
-        stats["duplicates_removed"] = before_dedup - after_dedup
-        stats["master_size_after"] = after_dedup
-        
-        logger.info(f"🔄 Removed {stats['duplicates_removed']} duplicates")
-        
-        # Create backup
-        if not master_df.empty:
-            os.makedirs(os.path.dirname(BACKUP_PATH), exist_ok=True)
+            combined_df = combined_df.drop_duplicates(subset=['text_hash'], keep='last')
             
-            # Timestamped backup
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            timestamped_backup = BACKUP_PATH.replace('.parquet', f'_{timestamp}.parquet')
-            
-            master_df.to_parquet(timestamped_backup)
-            logger.info(f"💾 Created backup: {timestamped_backup}")
-            
-            # Also keep latest backup
-            master_df.to_parquet(BACKUP_PATH)
-        
-        # Save merged dataset
+        stats["master_size_after"] = len(combined_df)
+        stats["duplicates_removed"] = (stats["master_size_before"] + len(new_df)) - len(combined_df)
+
+        # F. SAVE LOCAL
         combined_df.to_parquet(MASTER_DATA_PATH)
-        logger.info(f"✅ Saved merged dataset: {len(combined_df)} total samples (+{len(new_df)} new)")
         
-        # Clear processed logs
+        # G. UPLOAD HISTORY
+        push_master_data()
+        
+        # H. CLEANUP LOCAL LOGS (To keep container clean)
         if os.path.exists(LOGS_PATH):
-            # Archive instead of deleting
-            os.makedirs(ARCHIVE_PATH, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            archive_file = os.path.join(ARCHIVE_PATH, f"logs_{timestamp}.jsonl")
+            os.remove(LOGS_PATH)
             
-            os.rename(LOGS_PATH, archive_file)
-            logger.info(f"📦 Archived logs to {archive_file}")
-            
-            # Create new empty log file
-            open(LOGS_PATH, 'w').close()
-        
         stats["status"] = "success"
         return stats
-        
+
     except Exception as e:
         logger.error(f"❌ Merge failed: {e}", exc_info=True)
         stats["status"] = "failed"
-        stats["error"] = str(e)
         return stats
-
-# DATA VERSIONING
-@task(name="Version Control Data",log_prints=True,retries=1)
-def version_control_data() -> bool:
-    logger.info("📦 Versioning data with DVC...")
+    
+def validate_incoming_data(new_data: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    Validates the DataFrame passed from the Orchestrator.
+    """
+    if new_data is None or new_data.empty:
+        logger.warning("⚠️ Received empty DataFrame for validation")
+        return None
+    
+    logger.info(f"🔍 Validating {len(new_data)} raw records...")
     
     try:
-        # Check if DVC is initialized
-        if not os.path.exists('.dvc'):
-            logger.warning("⚠️  DVC not initialized, skipping versioning")
-            return False
+        # Validate required columns
+        required_cols = ['text', 'user_id', 'timestamp']
+        missing_cols = [col for col in required_cols if col not in new_data.columns]
         
-        # Add to DVC
-        result = subprocess.run(
-            ["dvc", "add", MASTER_DATA_PATH],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        logger.info(f"✅ DVC add successful")
+        if missing_cols:
+            logger.error(f"❌ Missing required columns: {missing_cols}")
+            return None
         
-        # Push to remote
-        result = subprocess.run(["dvc", "push"], capture_output=True, text=True, check=True)
-        logger.info(f"✅ DVC push successful")
+        # Filter by text length
+        valid_data = new_data[
+            (new_data['text'].str.len() >= MIN_TEXT_LENGTH) &
+            (new_data['text'].str.len() <= MAX_TEXT_LENGTH)
+        ].copy()
         
-        # Commit .dvc file to Git
-        dvc_file = f"{MASTER_DATA_PATH}.dvc"
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        logger.info(f"✅ {len(valid_data)} records passed length checks")
         
-        subprocess.run(["git", "add", dvc_file], check=True)
-        subprocess.run(
-            ["git", "commit", "-m", f"Data ingestion: {timestamp}"],
-            check=True
-        )
-        
-        logger.info("✅ Data versioned and committed to Git")
-        return True
-        
-    except subprocess.CalledProcessError as e:
-        logger.error(f"❌ Version control failed: {e.stderr}")
-        return False
-    except Exception as e:
-        logger.error(f"❌ Version control error: {e}")
-        return False
-
-# DRIFT DETECTION
-@task(name="Detect Data Drift", log_prints=True)
-def detect_data_drift(new_df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Compare new data distribution with master dataset to detect drift.
-    
-    Checks:
-    - Feature distribution shifts (KS test)
-    - Label distribution changes
-    - New vocabulary (unseen words)
-    """
-    logger.info("🔍 Checking for data drift...")
-    
-    drift_report = {
-        "timestamp": datetime.now().isoformat(),
-        "drift_detected": False,
-        "details": {}
-    }
-    
-    try:
-        if not os.path.exists(MASTER_DATA_PATH):
-            logger.info("No master dataset for comparison")
-            return drift_report
-        
-        master_df = pd.read_parquet(MASTER_DATA_PATH)
-        
-        # Label distribution drift
-        new_label_dist = new_df['label'].value_counts(normalize=True)
-        master_label_dist = master_df['label'].value_counts(normalize=True)
-        
-        label_drift = abs(new_label_dist - master_label_dist).max()
-        drift_report["details"]["label_distribution_drift"] = float(label_drift)
-        
-        if label_drift > 0.1:  # 10% threshold
-            logger.warning(f"⚠️  Label distribution drift detected: {label_drift:.2%}")
-            drift_report["drift_detected"] = True
-        
-        # Feature distribution drift (simple version)
-        numeric_features = ['msg_len', 'caps_ratio', 'slur_count']
-        
-        for feature in numeric_features:
-            if feature in new_df.columns and feature in master_df.columns:
-                new_mean = new_df[feature].mean()
-                master_mean = master_df[feature].mean()
-                
-                relative_change = abs(new_mean - master_mean) / (master_mean + 1e-8)
-                
-                if relative_change > 0.3:  # 30% threshold
-                    logger.warning(f"⚠️  {feature} drift: {relative_change:.2%} change")
-                    drift_report["details"][f"{feature}_drift"] = float(relative_change)
-                    drift_report["drift_detected"] = True
-        
-        if drift_report["drift_detected"]:
-            logger.warning("⚠️  Data drift detected - consider retraining model")
+        # Determine label source (Human vs Model)
+        if 'verified_label' in valid_data.columns:
+            valid_data = valid_data[valid_data['verified_label'].notna()].copy()
+            valid_data['label'] = valid_data['verified_label'].astype(int)
+            valid_data['label_source'] = 'human'
+            logger.info(f"✅ Using {len(valid_data)} human-verified labels")
+            
+        elif 'prediction' in valid_data.columns:
+            valid_data = valid_data[valid_data['prediction'].notna()].copy()
+            valid_data['label'] = valid_data['prediction'].astype(int)
+            valid_data['label_source'] = 'model'
+            logger.warning(f"⚠️ Using {len(valid_data)} model predictions as pseudo-labels")
+            
+        # Fallback: Try to use 'label' column if it exists (e.g. from sync script)
+        elif 'label' in valid_data.columns:
+             valid_data['label_source'] = 'existing'
+             logger.info(f"✅ Using {len(valid_data)} existing labels")
         else:
-            logger.info("✅ No significant drift detected")
+            logger.error("❌ No label column found (need 'verified_label', 'prediction', or 'label')")
+            return None
         
-        return drift_report
+        if len(valid_data) < MIN_NEW_SAMPLES:
+            logger.warning(f"⚠️ Only {len(valid_data)} valid samples (minimum: {MIN_NEW_SAMPLES})")
+            return None
+        
+        # Add metadata
+        valid_data['ingested_at'] = datetime.now().isoformat()
+        
+        # Deduplicate by text hash within the batch
+        if 'text_hash' in valid_data.columns:
+            before = len(valid_data)
+            valid_data = valid_data.drop_duplicates(subset=['text_hash'])
+            after = len(valid_data)
+            if before != after:
+                logger.info(f"🔄 Removed {before - after} duplicate samples inside this batch")
+        
+        return valid_data
         
     except Exception as e:
-        logger.error(f"Drift detection failed: {e}")
-        return drift_report
-
+        logger.error(f"❌ Validation failed: {e}", exc_info=True)
+        return None
+    
 # MAIN FLOW
 @flow(name="Data Ingestion Pipeline", log_prints=True)
-def data_ingestion_flow():
-    """
-    Main orchestration flow for data ingestion.
-    
-    Steps:
-    1. Load and validate raw logs
-    2. Engineer features
-    3. Run quality checks
-    4. Merge with master dataset
-    5. Version with DVC
-    6. Detect drift
-    7. Trigger retraining if needed
-    """
+def data_ingestion_flow(new_data: pd.DataFrame = None):
     logger.info("🚀 Starting data ingestion pipeline...")
+    if not new_data:
+        new_data = load_and_validate_logs()
+    else:
+        new_data = validate_incoming_data(new_data)
     
-    new_data = load_and_validate_logs()
-    
+
     if new_data is None:
         logger.info("✅ No new data to process")
-        return
+        return {"status": "skipped", "reason": "no_new_data"}
     
     processed_data = calculate_features(new_data)
     
@@ -477,17 +517,25 @@ def data_ingestion_flow():
     
     if not quality_ok:
         logger.error("Data quality checks failed - aborting ingestion")
-        return
+        return {"status": "failed", "reason": "quality_check_failed"}
     
     merge_stats = merge_and_save(processed_data)
     
     if merge_stats["status"] != "success":
         logger.error("Merge failed - aborting pipeline")
-        return
-    
-    version_control_data()
+        return merge_stats
     
     
+    logger.info("🔄 Syncing updated features to Redis...")
+    fs = FeatureStore()
+    fs.sync_offline_to_online(
+        parquet_path=MASTER_DATA_PATH,
+        feature_group_name="user_toxicity",
+        version="prod",
+        entity_key="user_id"
+    )
+    logger.info("✅ Feature Store sync complete")
+
     logger.info("\n" + "="*60)
     logger.info("📊 INGESTION SUMMARY")
     logger.info("="*60)
@@ -496,75 +544,9 @@ def data_ingestion_flow():
     logger.info(f"Duplicates removed: {merge_stats['duplicates_removed']}")
     logger.info("="*60)
 
+    return merge_stats
+
 
 if __name__ == "__main__":
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Data Ingestion Pipeline")
-    parser.add_argument("--schedule", action="store_true", help="Deploy with 2-week schedule")
-    parser.add_argument("--interval-days", type=int, default=14, help="Scheduling interval in days (default: 14)")
-    
-    args = parser.parse_args()
-    
-    if args.schedule:
-        logger.info(f"📅 Deploying with {args.interval_days}-day schedule...")
-        
-        deployment = Deployment.build_from_flow(
-            flow=data_ingestion_flow,
-            name="biweekly-data-ingestion",
-            schedule=IntervalSchedule(interval=timedelta(days=args.interval_days))
-        )
-        
-        deployment.apply()
-        logger.info("Deployment created successfully")
-    else:
-        # Run once
-        data_ingestion_flow()
+    data_ingestion_flow()
 
-# # cyberbullying-bot/
-# # │
-# # ├── .gitignore                   # Standard python gitignore
-# # ├── README.md                    # Architecture diagram & setup instructions
-# # ├── requirements-dev.txt         # Dev tools (pytest, black, flake8)
-# # │
-# # ├── 📂 api_service/              # [Service B] The "Brain" (FastAPI + Model)
-# # │   ├── app.py                   # Main FastAPI entrypoint
-# # │   ├── config.py                # Env vars (Feast path, Model path)
-# # │   ├── schemas.py               # Pydantic models (Input/Output validation)
-# # │   ├── core/
-# # │   │   ├── model.py             # DistilBERT + SVM loading & prediction logic
-# # │   │   ├── rules.py             # Regex/Hardcoded rule engine
-# # │   │   └── logger.py            # Structured JSON logger setup
-# # │   ├── feature_store/           # Feast Configuration
-# # │   │   ├── feature_store.yaml   # Connection to Offline(Parquet)/Online(SQLite)
-# # │   │   └── definitions.py       # Entity & Feature View definitions
-# # │   ├── artifacts/               # The "Artifact Store" (Git LFS tracked)
-# # │   │   ├── svm_model_v1.pkl     # Trained Classifier
-# # │   │   └── distilbert_config/   # (Optional) Tokenizer files
-# # │   ├── Dockerfile               # Build instruction for API container
-# # │   └── requirements.txt         # Dependencies (fastapi, torch, transformers)
-# # │
-# # ├── 📂 bot_service/              # [Service A] The "Enforcer" (Discord Bot)
-# # │   ├── bot.py                   # Main Discord Bot entrypoint
-# # │   ├── config.py                # Env vars (Discord Token, API URL)
-# # │   ├── cogs/                    # Modular Bot Commands
-# # │   │   ├── moderation.py        # The listener (on_message) logic
-# # │   │   └── admin.py             # Ops commands (!ops inject_drift)
-# # │   ├── Dockerfile               # Build instruction for Bot container
-# # │   └── requirements.txt         # Dependencies (discord.py, requests)
-# # │
-# # ├── 📂 mlops/                    # The "Level 4" Automation Scripts
-# # │   ├── generate_data.py         # Script to create fake user history (for Feast)
-# # │   ├── train.py                 # Script to train SVM from scratch
-# # │   ├── drift_monitor.py         # Script running Evidently AI checks
-# # │   └── retrain_flow.py          # Prefect flow (Drift -> Train -> Deploy)
-# # │
-# # ├── 📂 copilot/                  # AWS Infrastructure (Auto-generated)
-# # │   ├── api/                     # Manifest for Backend Service
-# # │   └── bot/                     # Manifest for Worker Service
-# # │
-# # └── 📂 data/                     # Local Data Lake (Git Ignored)
-# #     ├── raw_logs.json            # Appended logs from API
-# #     ├── registry.db              # SQLite Online Store (Feast)
-# #     └── offline_store/           # Parquet files
-# #         └── user_stats.parquet

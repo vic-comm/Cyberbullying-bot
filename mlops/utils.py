@@ -1,6 +1,7 @@
 import numpy as np
 import re
-
+import pandas as pd
+import hashlib
 BAD_WORDS = ["trash", "kill", "die", "ugly", "stupid", "idiot", "hate", "loser", "dumb"]
 PERSONAL_PRONOUNS = ["you", "your", "you're", "ur", "u"]
 
@@ -71,3 +72,8 @@ def _get_empty_features():
         "personal_pronoun_count": 0, "char_repetition": 0, 
         "all_caps_words": 0, "slur_count": 0
     }
+
+
+def compute_text_hash(self, text_series: pd.Series) -> pd.Series:
+        """Helper to create unique IDs for text content"""
+        return text_series.apply(lambda x: hashlib.sha256(x.encode('utf-8')).hexdigest())
