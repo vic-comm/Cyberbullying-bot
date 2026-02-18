@@ -607,12 +607,13 @@ class ModerationCog(commands.Cog):
         time_str = f"<t:{int(ts.timestamp())}:R>" if ts else "recently"
         embed.set_footer(text=f"Violation recorded {time_str}")
         # 5. Safe Send (Handle Blocked DMs)
+        feedback_view = FeedbackView(log_id=recent_log['id'], log_data=recent_log, db=self.bot.db, user_id=str(ctx.author.id), server_id=str(ctx.guild.id))
         try:
-            await ctx.author.send(embed=embed)
-            await ctx.message.delete() # Clean up command
+            await ctx.author.send(content="**Was this flag correct?**", embed=embed, view=feedback_view)   
+            await ctx.message.delete()
             await status_msg.edit(content="Example sent to your DMs! chk 📬")
         except discord.Forbidden:
-            await status_msg.edit(content=f"{ctx.author.mention} 🔒 I couldn't DM you. Here is your report:", embed=embed, delete_after=20)
+            await status_msg.edit(content=f"{ctx.author.mention} 🔒 I couldn't DM you. Here is your report:", view=feedback_view, embed=embed, delete_after=120)
             
     async def notify_mods(
         self,
@@ -746,3 +747,252 @@ def create_explanation_embed(explanation: dict, original_text: str, user: discor
     
     embed.set_footer(text="Powered by LIME & Hybrid AI")
     return embed
+
+# ═══════════════════════════════════════════════════════════════
+# bot_service/cogs/moderation.py
+# UPDATE: Add feedback buttons to !explain DM
+# ═══════════════════════════════════════════════════════════════
+
+# Add this View class to your moderation.py:
+
+class FeedbackView(discord.ui.View):
+    """
+    Feedback buttons shown in !explain DM.
+    User can dispute the model's decision.
+    """
+    
+    def __init__(self, log_id: int, log_data: dict, db, user_id: str, server_id: str):
+        super().__init__(timeout=None)  # Persistent buttons
+        self.log_id = log_id
+        self.log_data = log_data
+        self.db = db
+        self.user_id = str(user_id)
+        self.server_id = str(server_id)
+    
+    @discord.ui.button(
+        label="✅ Model was correct",
+        style=discord.ButtonStyle.success,
+        custom_id=f"feedback_correct"
+    )
+    async def feedback_correct(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        """User confirms model was correct"""
+        await self.db.record_user_dispute(
+            log_id=self.log_id,
+            user_id=self.user_id,
+            server_id=self.server_id,
+            user_claimed_label=1, # Admitting it is Toxic
+            platform='discord',
+            dispute_reason="User admitted guilt"
+        )
+        await interaction.response.send_message(
+            "✅ Thanks for confirming! This helps improve our AI.",
+            ephemeral=True
+        )
+        
+        # No database action needed - user agrees with model
+        
+        # Disable buttons
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+    
+    @discord.ui.button(
+        label="❌ Model was wrong",
+        style=discord.ButtonStyle.danger,
+        custom_id=f"feedback_wrong"
+    )
+    async def feedback_wrong(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        """User disputes the model's decision"""
+        
+        # Open modal to get dispute reason
+        modal = DisputeReasonModal(
+            log_id=self.log_id,
+            log_data=self.log_data,
+            db=self.db,
+            server_id=self.server_id
+        )
+        await interaction.response.send_modal(modal)
+        
+        # Disable buttons after modal submission
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Ensure only the person who got flagged can click the buttons."""
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("❌ This is not your report.", ephemeral=True)
+            return False
+        return True
+    
+class DisputeReasonModal(discord.ui.Modal, title="Dispute This Decision"):
+    """
+    Modal to collect why user thinks model was wrong.
+    """
+    
+    reason = discord.ui.TextInput(
+        label="Why was this flagged incorrectly?",
+        style=discord.TextStyle.paragraph,
+        placeholder="Example: This was sarcasm, not actually toxic\nExample: This is gaming slang, not harassment",
+        required=False,
+        max_length=500
+    )
+    
+    def __init__(self, log_id: int, log_data: dict, db, server_id: str):
+        super().__init__()
+        self.log_id = log_id
+        self.log_data = log_data
+        self.db = db
+        self.server_id = server_id
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        """Record the dispute"""
+        
+        user_id = str(interaction.user.id)
+        
+        # Determine what model predicted
+        predicted_label = 1 if self.log_data['severity'] in ['LOW', 'MEDIUM', 'HIGH'] else 0
+        
+        # User claims it should be safe (opposite of model)
+        user_claimed_label = 0 if predicted_label == 1 else 1
+        
+        try:
+            # Record dispute in database
+            feedback_id = await self.db.record_user_dispute(
+                log_id=self.log_id,
+                user_id=user_id,
+                server_id=self.server_id,
+                user_claimed_label=user_claimed_label,
+                platform='discord',
+                dispute_reason=self.reason.value or None
+            )
+            
+            # Confirm to user
+            await interaction.response.send_message(
+                "📝 **Dispute recorded!**\n\n"
+                "An admin will review this decision. If they agree with you, "
+                "our AI will learn from this mistake.\n\n"
+                "Thank you for helping improve our moderation!",
+                ephemeral=True
+            )
+            
+            logger.info(f"Dispute recorded: feedback_id={feedback_id}, log_id={self.log_id}, user={user_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to record dispute: {e}", exc_info=True)
+            await interaction.response.send_message(
+                "❌ Failed to record dispute. Please contact an admin.",
+                ephemeral=True
+            )
+
+
+# ═══════════════════════════════════════════════════════════════
+# UPDATE YOUR explain_my_violation COMMAND
+# ═══════════════════════════════════════════════════════════════
+
+# In your existing explain_my_violation command, replace the DM section with:
+
+@commands.command(name='whyflagged', aliases=['explain', 'why'])
+@commands.cooldown(1, 15, commands.BucketType.user)  # Reduced cooldown
+async def explain_my_violation(self, ctx):
+    """
+    Let users see why their last message was flagged + dispute it.
+    """
+    server_id = str(ctx.guild.id)
+    user_id = str(ctx.author.id)
+    
+    status_msg = await ctx.send("🔍 Looking up your recent history...", delete_after=5)
+    
+    # Get most recent violation
+    recent_log = await self.bot.db.get_latest_user_violation(
+        server_id, user_id, platform='discord', hours=24 
+    )
+    
+    if not recent_log:
+        await ctx.send("✅ No violations found in the last 24 hours.", delete_after=10)
+        return
+    
+    # Generate/get explanation
+    explanation = recent_log.get('explanation')
+    if isinstance(explanation, str):
+        try:
+            explanation = json.loads(explanation)
+        except json.JSONDecodeError:
+            explanation = None
+    
+    if not explanation:
+        await status_msg.edit(content="⏳ Generating deep analysis... (approx 3s)")
+        
+        payload = {
+            "text": recent_log['message'],
+            "user_id": user_id,
+            "channel_id": str(ctx.channel.id),
+            "num_features": 6
+        }
+        
+        try:
+            async with self.bot.session.post(
+                f"{self.bot.config.API_BASE_URL}/explain",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10.0),
+                ssl=False
+            ) as response:
+                if response.status == 200:
+                    explanation = await response.json()
+                    await self.bot.db.update_log_explanation(recent_log['id'], explanation)
+                else:
+                    await ctx.send("❌ Analysis failed. Please ask a moderator.", delete_after=10)
+                    return
+        except Exception as e:
+            logger.error(f"Explanation API failed: {e}")
+            await ctx.send("❌ System busy. Try again later.", delete_after=10)
+            return
+    
+    # Create explanation embed
+    embed = create_explanation_embed(
+        explanation=explanation,
+        original_text=recent_log['message'],
+        user=ctx.author,
+        fallback_score=recent_log.get('toxicity_score', 0.0)
+    )
+    
+    # Add timestamp footer
+    ts = recent_log['timestamp']
+    time_str = f"<t:{int(ts.timestamp())}:R>" if ts else "recently"
+    embed.set_footer(text=f"Violation recorded {time_str}")
+    
+    # ═══════════════════════════════════════════════════════════
+    # ADD FEEDBACK BUTTONS
+    # ═══════════════════════════════════════════════════════════
+    
+    feedback_view = FeedbackView(
+        log_id=recent_log['id'],
+        log_data=recent_log,
+        db=self.bot.db
+    )
+    
+    # Send to DM with feedback buttons
+    try:
+        await ctx.author.send(
+            content="**Was this flag correct?**",
+            embed=embed,
+            view=feedback_view
+        )
+        await ctx.message.delete()
+        await status_msg.edit(content="✅ Explanation sent to your DMs! 📬", delete_after=10)
+        
+    except discord.Forbidden:
+        # Fallback: send in channel (without buttons for privacy)
+        await status_msg.edit(
+            content=f"{ctx.author.mention} 🔒 I couldn't DM you. Here is your report:",
+            delete_after=20
+        )
+        await ctx.send(embed=embed, delete_after=30)

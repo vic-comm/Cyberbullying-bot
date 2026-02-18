@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 from unidecode import unidecode
 from discord.ext import commands
-
+from bot_service.init_db import init_database
 # Import internal modules
 from bot_service.database import DatabaseManager
 from bot_service.config import Config
@@ -116,6 +116,7 @@ class ModerationBot(commands.Bot):
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5.0))
         await self.db.init_db()
+        # await init_database()
         
         # Initialize Services
         self.config_manager = ConfigManager(self.db)
@@ -123,6 +124,7 @@ class ModerationBot(commands.Bot):
         
         # Load Cogs
         await self.load_extension('bot_service.cogs.admin')
+        await self.load_extension('bot_service.cogs.admin_review')
         await self.load_extension('bot_service.cogs.moderation')
         
         print("✅ Bot setup complete (Database & Cogs loaded)")
@@ -265,6 +267,31 @@ async def clearstrikes(ctx: commands.Context, user: discord.Member):
     else:
         await ctx.send(f"✅ Cleared all strikes for {user.mention}")
 
+
+@bot.command(name="sync")
+@commands.has_permissions(administrator=True)
+async def sync(ctx):
+    """
+    Forces Discord to update slash commands for THIS server immediately.
+    """
+    msg = await ctx.send("🔄 Syncing slash commands...")
+    
+    try:
+        # 1. Clear existing commands to force a refresh (optional but helpful)
+        bot.tree.clear_commands(guild=ctx.guild)
+        
+        # 2. Copy global commands (like /review) to this specific server
+        bot.tree.copy_global_to(guild=ctx.guild)
+        
+        # 3. Push the update to Discord
+        synced = await bot.tree.sync(guild=ctx.guild)
+        
+        await msg.edit(content=f"✅ Success! Synced {len(synced)} commands: {[c.name for c in synced]}")
+        print(f"Synced commands: {[c.name for c in synced]}")
+        
+    except Exception as e:
+        await msg.edit(content=f"❌ Failed to sync: {e}")
+        
 if __name__ == "__main__":
     if not bot.config.DISCORD_TOKEN:
         print(" Error: DISCORD_TOKEN not found in environment variables")

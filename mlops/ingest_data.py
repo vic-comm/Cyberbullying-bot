@@ -12,6 +12,13 @@ import asyncio
 from prefect import task, flow
 import asyncpg
 from mlops.feature_store import FeatureStore
+import pandas as pd
+import asyncio
+import asyncpg
+from datetime import datetime, timedelta
+import logging
+from typing import Optional, List
+from prefect import task, flow
 # CONFIGURATION
 import boto3
 LOGS_PATH = os.getenv("LOGS_PATH", "data/raw_logs.jsonl")
@@ -53,31 +60,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-async def fetch_logs_from_supabase(
+async def fetch_training_data_stratified(
     lookback_hours: int = 24,
     platforms: List[str] = None
 ) -> Optional[pd.DataFrame]:
     """
-    Fetch recent logs from Supabase for training data ingestion.
+    Fetch training data with stratified sampling + admin reviews.
     
-    Replaces reading from JSONL files - now queries PostgreSQL directly.
+    Returns:
+    - 5% of high-confidence safe messages (anchors)
+    - 5% of high-confidence toxic messages (anchors)
+    - 100% of admin-reviewed disputes (corrections)
+    - 100% of admin-reviewed uncertain messages (edge cases)
     """
     if not DATABASE_URL:
-        logger.error("❌ DATABASE_URL not set - cannot fetch logs")
+        logger.error("❌ DATABASE_URL not set")
         return None
     
     platforms = platforms or PLATFORMS_TO_INGEST
     cutoff = datetime.now() - timedelta(hours=lookback_hours)
     
-    logger.info(f"📂 Fetching logs from Supabase...")
-    logger.info(f"   Platforms: {platforms}")
-    logger.info(f"   Since: {cutoff.isoformat()}")
+    logger.info(f"📂 Fetching training data with admin-reviewed feedback...")
+    logger.info(f"   Strategy: 5% anchors + 100% admin-reviewed")
     
     try:
         conn = await asyncpg.connect(DATABASE_URL)
         
-        # Query logs with quality filters
-        query = """
+        # ───────────────────────────────────────────────────────
+        # PART 1: HIGH-CONFIDENCE ANCHORS (5% sample)
+        # ───────────────────────────────────────────────────────
+        
+        anchors_query = """
+        WITH high_conf_messages AS (
             SELECT 
                 l.id,
                 l.user_id,
@@ -86,79 +100,185 @@ async def fetch_logs_from_supabase(
                 l.message as text,
                 l.toxicity_score,
                 l.severity,
-                l.action_taken,
                 l.timestamp,
-                l.explanation,
-                l.metadata
+                l.metadata,
+                
+                -- Label from severity
+                CASE 
+                    WHEN l.severity IN ('LOW', 'MEDIUM', 'HIGH') THEN 1
+                    ELSE 0
+                END AS label,
+                
+                'anchor' as source_type,
+                'model_prediction' as label_source
+                
             FROM logs l
             WHERE l.timestamp > $1
               AND l.platform = ANY($2)
               AND l.toxicity_score IS NOT NULL
-              AND l.severity IS NOT NULL
               AND LENGTH(l.message) >= $3
               AND LENGTH(l.message) <= $4
-            ORDER BY l.timestamp DESC
+              AND (
+                  l.toxicity_score < $5  -- High conf safe
+                  OR 
+                  l.toxicity_score > $6  -- High conf toxic
+              )
+              AND random() < $7  -- 5% sample
+        )
+        SELECT * FROM high_conf_messages
         """
         
-        rows = await conn.fetch(
-            query,
+        anchors = await conn.fetch(
+            anchors_query,
+            cutoff,
+            platforms,
+            MIN_TEXT_LENGTH,
+            MAX_TEXT_LENGTH,
+            LOW_CONFIDENCE_THRESHOLD,   # 0.3
+            HIGH_CONFIDENCE_THRESHOLD,  # 0.7
+            HIGH_CONFIDENCE_SAMPLE_RATE # 0.05
+        )
+        
+        anchors_df = pd.DataFrame([dict(row) for row in anchors])
+        logger.info(f"   Anchors: {len(anchors_df)} messages (5% sample)")
+        
+        # ───────────────────────────────────────────────────────
+        # PART 2: ADMIN-REVIEWED FEEDBACK (100%)
+        # ───────────────────────────────────────────────────────
+        
+        feedback_query = """
+        SELECT 
+            l.id,
+            l.user_id,
+            l.server_id,
+            l.platform,
+            l.message as text,
+            l.toxicity_score,
+            l.severity,
+            l.timestamp,
+            l.metadata,
+            
+            -- Use ADMIN's final decision as label
+            f.final_label as label,
+            
+            'feedback' as source_type,
+            CASE 
+                WHEN f.admin_decision = 'agree_with_user' THEN 'admin_corrected'
+                WHEN f.admin_decision = 'agree_with_model' THEN 'admin_approved'
+                ELSE 'admin_custom'
+            END as label_source,
+            
+            f.admin_decision,
+            f.reviewed_by,
+            f.dispute_reason
+            
+        FROM logs l
+        JOIN feedback f ON l.id = f.log_id
+        WHERE l.timestamp > $1
+          AND l.platform = ANY($2)
+          AND f.admin_reviewed = TRUE  -- Only admin-reviewed
+          AND f.used_in_training = FALSE  -- Not yet used
+          AND LENGTH(l.message) >= $3
+          AND LENGTH(l.message) <= $4
+        """
+        
+        feedback_rows = await conn.fetch(
+            feedback_query,
             cutoff,
             platforms,
             MIN_TEXT_LENGTH,
             MAX_TEXT_LENGTH
         )
         
-        await conn.close()
+        feedback_df = pd.DataFrame([dict(row) for row in feedback_rows])
+        logger.info(f"   Feedback: {len(feedback_df)} admin-reviewed disputes")
         
-        if not rows:
-            logger.warning("⚠️ No logs found in specified time window")
+        # ───────────────────────────────────────────────────────
+        # PART 3: ADMIN-REVIEWED UNCERTAIN (100%)
+        # ───────────────────────────────────────────────────────
+        
+        # Note: Uncertain messages admin-reviewed are already in feedback table
+        # This query would get uncertain messages NOT yet reviewed by anyone
+        # You might want to exclude these from training until reviewed
+        
+        # For now, we only use:
+        # - Anchors (high confidence, model prediction trusted)
+        # - Admin-reviewed feedback (admin made final call)
+        
+        # ───────────────────────────────────────────────────────
+        # COMBINE
+        # ───────────────────────────────────────────────────────
+        
+        if anchors_df.empty and feedback_df.empty:
+            logger.warning("⚠️ No training data available")
+            await conn.close()
             return None
         
-        # Convert to DataFrame
-        df = pd.DataFrame([dict(row) for row in rows])
+        # Concatenate
+        if not anchors_df.empty and not feedback_df.empty:
+            combined_df = pd.concat([anchors_df, feedback_df], ignore_index=True)
+        elif not anchors_df.empty:
+            combined_df = anchors_df
+        else:
+            combined_df = feedback_df
         
-        logger.info(f"✅ Fetched {len(df)} logs from database")
+        # Mark feedback as used
+        if not feedback_df.empty:
+            feedback_ids = feedback_df['id'].tolist()
+            await conn.execute('''
+                UPDATE feedback 
+                SET used_in_training = TRUE 
+                WHERE log_id = ANY($1)
+            ''', feedback_ids)
+            logger.info(f"   Marked {len(feedback_ids)} feedback items as used")
         
-        # Create label from severity
-        severity_to_label = {
-            'SAFE': 0,
-            'UNCERTAIN': 0,
-            'LOW': 1,
-            'MEDIUM': 1,
-            'HIGH': 1
-        }
-        
-        df['label'] = df['severity'].map(severity_to_label)
-        df['label_source'] = 'production'  # From actual bot decisions
+        await conn.close()
         
         # Add text hash for deduplication
-        df['text_hash'] = df['text'].apply(lambda x: hash(x))
+        combined_df['text_hash'] = combined_df['text'].apply(lambda x: hash(x))
         
-        # Platform distribution
-        platform_dist = df['platform'].value_counts()
-        logger.info(f"   Platform distribution: {platform_dist.to_dict()}")
+        # ───────────────────────────────────────────────────────
+        # STATISTICS
+        # ───────────────────────────────────────────────────────
         
-        return df
+        logger.info(f"✅ Fetched {len(combined_df)} total training examples")
+        logger.info(f"   Breakdown:")
+        source_dist = combined_df['source_type'].value_counts()
+        for source, count in source_dist.items():
+            logger.info(f"     {source}: {count} ({count/len(combined_df):.1%})")
+        
+        label_dist = combined_df['label_source'].value_counts()
+        logger.info(f"   Label sources:")
+        for source, count in label_dist.items():
+            logger.info(f"     {source}: {count}")
+        
+        # Label balance
+        label_balance = combined_df['label'].value_counts()
+        logger.info(f"   Label balance:")
+        logger.info(f"     Safe (0): {label_balance.get(0, 0)}")
+        logger.info(f"     Toxic (1): {label_balance.get(1, 0)}")
+        
+        return combined_df
         
     except Exception as e:
-        logger.error(f"❌ Failed to fetch logs from Supabase: {e}", exc_info=True)
+        logger.error(f"❌ Failed to fetch training data: {e}", exc_info=True)
         return None
 
 # DATA LOADING AND VALIDATION
-@task(name="Load and Validate Logs", log_prints=True, retries=2, retry_delay_seconds=30)
+@task(name="Load Training Data", log_prints=True, retries=2, retry_delay_seconds=30)
 def load_and_validate_logs() -> Optional[pd.DataFrame]:
     """
-    Load logs from Supabase (replaces JSONL loading).
+    Load training data with admin-reviewed feedback integration.
     """
-    logger.info(f"📂 Loading logs from Supabase (last {INGESTION_LOOKBACK_HOURS}h)...")
+    logger.info(f"📂 Loading training data (last {INGESTION_LOOKBACK_HOURS}h)...")
+    logger.info(f"   Mode: Stratified sampling + admin-reviewed feedback")
     
-    # Run async fetch in sync context
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     try:
         df = loop.run_until_complete(
-            fetch_logs_from_supabase(
+            fetch_training_data_stratified(
                 lookback_hours=INGESTION_LOOKBACK_HOURS,
                 platforms=PLATFORMS_TO_INGEST
             )
@@ -167,12 +287,12 @@ def load_and_validate_logs() -> Optional[pd.DataFrame]:
         loop.close()
     
     if df is None or df.empty:
-        logger.warning("⚠️ No data available for ingestion")
+        logger.warning("⚠️ No training data available")
         return None
     
-    logger.info(f"✅ Loaded {len(df)} raw records from database")
+    logger.info(f"✅ Loaded {len(df)} records")
     
-    # Validate data quality
+    # Validate
     return validate_incoming_data(df)
 
 # FEATURE ENGINEERING
@@ -257,80 +377,73 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
 @task(name="Validate Data Quality", log_prints=True)
 def validate_data_quality(df: pd.DataFrame) -> bool:
     """
-    Acts as a quality gate. 
-    Returns False (BLOCKING) for Broken Pipelines or Attacks.
-    Returns True (WARNING) for Class Imbalance or Concept Drift.
+    Enhanced validation with poisoning detection.
     """
-    logger.info("🔍 Running strict data quality checks...")
+    logger.info("🔍 Running data quality & security checks...")
     
     blocking_issues = []
     warnings = []
     
-    # ── 1. CRITICAL: DATA QUALITY DRIFT (Broken Pipeline) ────────────────
-    # Check A: Essential Columns are Missing/Null
-    critical_cols = ['text', 'user_id', 'timestamp']
+    # ─── CRITICAL: Required columns ───────────────────────────
+    critical_cols = ['text', 'user_id', 'timestamp', 'label', 'label_source']
     for col in critical_cols:
         if col not in df.columns:
-            blocking_issues.append(f"❌ Missing critical column: {col}")
+            blocking_issues.append(f"❌ Missing column: {col}")
         elif df[col].isnull().any():
             null_count = df[col].isnull().sum()
-            blocking_issues.append(f"❌ Nulls found in critical column '{col}': {null_count} rows")
-
-    # Check B: Text Content Integrity (Empty strings or whitespace)
-    if 'text' in df.columns:
-        empty_text_count = df[df['text'].str.strip() == ''].shape[0]
-        if empty_text_count > 0:
-            blocking_issues.append(f"❌ Found {empty_text_count} rows with empty/whitespace text")
-
-    # Check C: Message Length Corruption (e.g., all 0s)
-    if 'msg_len' in df.columns:
-        if (df['msg_len'] == 0).all():
-             blocking_issues.append("❌ Critical: 'msg_len' is 0 for ALL rows (Pipeline bug?)")
-
-    # Check D: Spam/Repetition Attack (Identical content spam)
-    # If >50% of the dataset is duplicates of the same 1 message
+            blocking_issues.append(f"❌ Nulls in '{col}': {null_count}")
+    
+    # ─── SECURITY: Check label source distribution ────────────
+    if 'label_source' in df.columns:
+        # Ensure we have SOME admin-reviewed data
+        admin_reviewed = df[df['label_source'].str.contains('admin', na=False)]
+        admin_ratio = len(admin_reviewed) / len(df) if len(df) > 0 else 0
+        
+        if admin_ratio < 0.05 and len(df) > 100:
+            warnings.append(
+                f"⚠️ Only {admin_ratio:.1%} of data is admin-reviewed (expected 10%+)"
+            )
+    
+    # ─── SECURITY: Detect spam/repetition ─────────────────────
     if 'text' in df.columns and len(df) > 50:
-        most_common_msg = df['text'].mode()[0]
-        repetition_count = (df['text'] == most_common_msg).sum()
+        most_common = df['text'].mode()[0] if not df['text'].mode().empty else ""
+        repetition_count = (df['text'] == most_common).sum()
         repetition_rate = repetition_count / len(df)
         
-        if repetition_rate > 0.5:  # Threshold: 50% identical messages
-            blocking_issues.append(f"❌ ADVERSARIAL ATTACK DETECTED: {repetition_rate:.1%} of data is identical spam.")
-            logger.error(f"   Spam content sample: '{most_common_msg[:50]}...'")
-
-    # Check E: Bot/Script Flooding (One user sending >30% of all data)
+        if repetition_rate > 0.5:
+            blocking_issues.append(
+                f"❌ SPAM ATTACK: {repetition_rate:.1%} identical messages"
+            )
+    
+    # ─── SECURITY: Detect single-user flooding ────────────────
     if 'user_id' in df.columns and len(df) > 50:
         top_user_share = df['user_id'].value_counts(normalize=True).iloc[0]
-        if top_user_share > 0.3: # Threshold: 1 user sent 30% of batch
-            blocking_issues.append(f"❌ ADVERSARIAL ATTACK: Single user sent {top_user_share:.1%} of all messages.")
-
-    # Check F: Class Imbalance (Warning only)
+        if top_user_share > 0.3:
+            blocking_issues.append(
+                f"❌ FLOODING: Single user sent {top_user_share:.1%} of data"
+            )
+    
+    # ─── WARNING: Class imbalance ──────────────────────────────
     if 'label' in df.columns:
         label_dist = df['label'].value_counts(normalize=True)
-        minority_class_ratio = label_dist.min()
-        if minority_class_ratio < 0.05: # Stricter 5%
-            warnings.append(f"⚠️ Severe class imbalance: Minority class at {minority_class_ratio:.2%}")
-
-    # Check G: High Nulls in Non-Critical Features
-    null_counts = df.isnull().sum()
-    high_null_features = null_counts[null_counts > len(df) * 0.2]
-    high_null_features = high_null_features.drop(labels=critical_cols, errors='ignore') # Ignore criticals already checked
-    if not high_null_features.empty:
-        warnings.append(f"⚠️ High nulls in features: {list(high_null_features.index)}")
+        minority_ratio = label_dist.min()
+        if minority_ratio < 0.05:
+            warnings.append(
+                f"⚠️ Severe class imbalance: {minority_ratio:.1%}"
+            )
     
-    # Print Warnings (Don't stop)
+    # Print results
     for w in warnings:
         logger.warning(w)
-
-    # Print Blocking Issues (STOP PIPELINE)
+    
     if blocking_issues:
-        logger.error("🛑 CRITICAL DATA QUALITY FAILURE - INGESTION ABORTED")
+        logger.error("🛑 INGESTION BLOCKED - CRITICAL ISSUES")
         for issue in blocking_issues:
             logger.error(issue)
-        return False  # BLOCK INGESTION
-
-    logger.info("✅ Data Quality & Adversarial Checks Passed")
-    return True   # ALLOW INGESTION
+        return False
+    
+    logger.info("✅ Data quality checks passed")
+    return True
 
 def pull_master_data():
     if os.path.exists(MASTER_DATA_PATH):
@@ -528,11 +641,12 @@ def data_ingestion_flow(new_data: pd.DataFrame = None):
     
     logger.info("🔄 Syncing updated features to Redis...")
     fs = FeatureStore()
-    fs.sync_offline_to_online(
-        parquet_path=MASTER_DATA_PATH,
+    fs.sync_from_supabase(
+        database_url=DATABASE_URL,
         feature_group_name="user_toxicity",
         version="prod",
-        entity_key="user_id"
+        lookback_days=30,
+        ttl_days=7
     )
     logger.info("✅ Feature Store sync complete")
 

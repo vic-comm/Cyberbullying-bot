@@ -669,3 +669,335 @@ class DatabaseManager:
                         
                 return data
             return None
+        
+    async def record_user_dispute(
+        self,
+        log_id: int,
+        user_id: str,
+        server_id: str,
+        user_claimed_label: int,  # 0=safe, 1=toxic
+        platform: str = 'discord',
+        dispute_reason: str = None
+    ) -> int:
+        """
+        Record when a user disputes a moderation decision.
+        
+        Args:
+            log_id: ID of the log entry being disputed
+            user_id: User who is disputing
+            server_id: Server where dispute occurred
+            user_claimed_label: What user claims (0=safe, 1=toxic)
+            platform: Platform (discord/slack/whatsapp)
+            dispute_reason: Optional text reason from user
+        
+        Returns:
+            feedback_id: ID of created/updated feedback entry
+        """
+        async with self.pool.acquire() as conn:
+            feedback_id = await conn.fetchval(
+                'SELECT record_user_dispute($1, $2, $3, $4, $5, $6)',
+                log_id,
+                user_id,
+                server_id,
+                platform,
+                user_claimed_label,
+                dispute_reason
+            )
+            return feedback_id
+
+    # ───────────────────────────────────────────────────────────────
+    # ADMIN REVIEW QUEUE
+    # ───────────────────────────────────────────────────────────────
+
+    async def get_pending_review_count(
+        self,
+        server_id: str
+    ) -> int:
+        """Get count of items pending admin review"""
+        async with self.pool.acquire() as conn:
+            count = await conn.fetchval(
+                'SELECT get_pending_review_count($1)',
+                server_id
+            )
+            return count or 0
+
+
+    async def get_review_queue(
+        self,
+        server_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        filter_by: str = None,
+        user_id: str = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get a unified queue of items needing review:
+        1. User Disputes (High Priority)
+        2. Uncertain Predictions (Proactive Review)
+        """
+        async with self.pool.acquire() as conn:
+            # We construct a query that standardizes columns from both sources
+            query = '''
+            WITH combined_queue AS (
+                -- 1. USER DISPUTES
+                SELECT 
+                    'dispute' as type,
+                    f.id as feedback_id,
+                    f.log_id,
+                    f.user_id,
+                    f.server_id,
+                    l.message as text,
+                    l.toxicity_score,
+                    f.predicted_label,
+                    f.user_claimed_label,
+                    f.dispute_reason,
+                    f.disputed_at as sort_time
+                FROM feedback f
+                JOIN logs l ON f.log_id = l.id
+                WHERE f.server_id = $1 AND f.admin_reviewed = FALSE
+                
+                UNION ALL
+                
+                -- 2. UNCERTAIN MESSAGES (No feedback ID yet)
+                SELECT 
+                    'uncertain' as type,
+                    NULL as feedback_id, -- Placeholder
+                    l.id as log_id,
+                    l.user_id,
+                    l.server_id,
+                    l.message as text,
+                    l.toxicity_score,
+                    CASE WHEN l.severity IN ('LOW','MEDIUM','HIGH') THEN 1 ELSE 0 END as predicted_label,
+                    NULL as user_claimed_label, -- No user claim
+                    'Model confidence is low (' || ROUND(l.toxicity_score::numeric * 100, 1) || '%)' as dispute_reason,
+                    l.timestamp as sort_time
+                FROM logs l
+                WHERE l.server_id = $1
+                  AND l.toxicity_score BETWEEN 0.3 AND 0.7
+                  -- Exclude items that already have feedback (don't show duplicates)
+                  AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.log_id = l.id)
+            )
+            SELECT * FROM combined_queue
+            ORDER BY 
+                CASE WHEN type = 'dispute' THEN 0 ELSE 1 END, -- Show disputes first
+                sort_time ASC
+            LIMIT $2 OFFSET $3
+            '''
+            
+            rows = await conn.fetch(query, server_id, limit, offset)
+            return [dict(row) for row in rows]
+
+    async def get_uncertain_messages(
+        self,
+        server_id: str,
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Get uncertain messages (0.3-0.7 confidence) for admin review"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT * FROM uncertain_messages
+                WHERE server_id = $1
+                AND has_feedback = FALSE
+                ORDER BY timestamp DESC
+                LIMIT $2
+            ''', server_id, limit)
+            
+            return [dict(row) for row in rows]
+
+
+    async def get_review_queue_grouped(
+        self,
+        server_id: str,
+        group_by: str = 'user'  # 'user' | 'channel' | 'time'
+    ) -> Dict[str, List[Dict]]:
+        """
+        Get review queue grouped for bulk operations.
+        
+        Returns dict like:
+        {
+            'user_123': [item1, item2, item3],
+            'user_456': [item4, item5]
+        }
+        """
+        async with self.pool.acquire() as conn:
+            if group_by == 'user':
+                rows = await conn.fetch('''
+                    SELECT 
+                        user_id,
+                        json_agg(
+                            json_build_object(
+                                'feedback_id', feedback_id,
+                                'log_id', log_id,
+                                'text', text,
+                                'toxicity_score', toxicity_score,
+                                'predicted_label', predicted_label,
+                                'user_claimed_label', user_claimed_label,
+                                'disputed_at', disputed_at
+                            ) ORDER BY disputed_at DESC
+                        ) as items
+                    FROM admin_review_queue
+                    WHERE server_id = $1
+                    GROUP BY user_id
+                    ORDER BY COUNT(*) DESC
+                ''', server_id)
+                
+                return {row['user_id']: row['items'] for row in rows}
+            
+            # Add other grouping options as needed
+            return {}
+
+
+    # ───────────────────────────────────────────────────────────────
+    # ADMIN REVIEW ACTIONS
+    # ───────────────────────────────────────────────────────────────
+
+    async def admin_review_feedback(
+        self,
+        feedback_id: int,
+        admin_id: str,
+        decision: str,  # 'agree_with_model' | 'agree_with_user' | 'custom'
+        final_label: int = None,
+        notes: str = None
+    ) -> bool:
+        """
+        Record admin's review decision on a feedback item.
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                'SELECT admin_review_feedback($1, $2, $3, $4, $5)',
+                feedback_id,
+                admin_id,
+                decision,
+                final_label,
+                notes
+            )
+            return result
+
+
+    async def bulk_approve_model(
+        self,
+        feedback_ids: List[int],
+        admin_id: str
+    ) -> int:
+        """
+        Bulk approve: admin agrees with model on multiple items.
+        
+        Returns count of items approved.
+        """
+        async with self.pool.acquire() as conn:
+            count = await conn.fetchval(
+                'SELECT bulk_approve_model($1, $2)',
+                feedback_ids,
+                admin_id
+            )
+            return count or 0
+
+
+    async def bulk_approve_users(
+        self,
+        feedback_ids: List[int],
+        admin_id: str
+    ) -> int:
+        """
+        Bulk approve: admin agrees with users on multiple items.
+        """
+        async with self.pool.acquire() as conn:
+            # Use similar logic to bulk_approve_model but agree with user
+            await conn.execute('''
+                UPDATE feedback SET
+                    admin_reviewed = TRUE,
+                    admin_decision = 'agree_with_user',
+                    final_label = user_claimed_label,
+                    reviewed_by = $2,
+                    reviewed_at = NOW()
+                WHERE id = ANY($1)
+                AND admin_reviewed = FALSE
+            ''', feedback_ids, admin_id)
+            
+            return len(feedback_ids)
+
+
+    # ───────────────────────────────────────────────────────────────
+    # STATS & ANALYTICS
+    # ───────────────────────────────────────────────────────────────
+
+    async def get_feedback_stats(
+        self,
+        server_id: str,
+        days: int = 30
+    ) -> Dict[str, Any]:
+        """Get feedback statistics for admin dashboard"""
+        async with self.pool.acquire() as conn:
+            stats = await conn.fetchrow('''
+                SELECT
+                    COUNT(*) as total_disputes,
+                    SUM(CASE WHEN admin_reviewed THEN 1 ELSE 0 END) as reviewed,
+                    SUM(CASE WHEN NOT admin_reviewed THEN 1 ELSE 0 END) as pending,
+                    SUM(CASE WHEN admin_decision = 'agree_with_model' THEN 1 ELSE 0 END) as model_correct,
+                    SUM(CASE WHEN admin_decision = 'agree_with_user' THEN 1 ELSE 0 END) as user_correct,
+                    AVG(EXTRACT(EPOCH FROM (reviewed_at - disputed_at)) / 3600) as avg_review_time_hours
+                FROM feedback
+                WHERE server_id = $1
+                AND disputed_at > NOW() - ($2 || ' days')::INTERVAL
+            ''', server_id, str(days))
+            
+            return dict(stats) if stats else {}
+
+
+    async def get_top_disputing_users(
+        self,
+        server_id: str,
+        limit: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Get users with most disputes (potential bad actors)"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch('''
+                SELECT 
+                    user_id,
+                    COUNT(*) as dispute_count,
+                    SUM(CASE WHEN admin_decision = 'agree_with_user' THEN 1 ELSE 0 END) as correct_disputes,
+                    SUM(CASE WHEN admin_decision = 'agree_with_model' THEN 1 ELSE 0 END) as wrong_disputes,
+                    MAX(disputed_at) as last_dispute
+                FROM feedback
+                WHERE server_id = $1
+                AND disputed_at > NOW() - INTERVAL '30 days'
+                GROUP BY user_id
+                ORDER BY COUNT(*) DESC
+                LIMIT $2
+            ''', server_id, limit)
+            
+            return [dict(row) for row in rows]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
