@@ -28,53 +28,44 @@ class FeatureStore:
     """
     
     def __init__(
-        self,
-        redis_host: str = 'localhost',
-        redis_port: int = 6379,
-        redis_db: int = 0,
-        redis_password: Optional[str] = None,
-        max_connections: int = 50,
-        socket_timeout: float = 5.0,
-        socket_connect_timeout: float = 5.0
-    ):
-        """
-        Initialize Feature Store with Redis connection.
-        
-        Args:
-            redis_host: Redis server hostname
-            redis_port: Redis server port
-            redis_db: Redis database number
-            redis_password: Redis password (if required)
-            max_connections: Max connections in pool
-            socket_timeout: Socket operation timeout in seconds
-            socket_connect_timeout: Socket connection timeout in seconds
-        """
-        self.redis_host = redis_host
-        self.redis_port = redis_port
-        
-        try:
-            # Create connection pool for better performance
-            self.pool = ConnectionPool(
-                host=redis_host,
-                port=redis_port,
-                db=redis_db,
-                password=redis_password,
-                max_connections=max_connections,
-                socket_timeout=socket_timeout,
-                socket_connect_timeout=socket_connect_timeout,
-                decode_responses=True  # Auto-decode bytes to strings
-            )
+            self,
+            redis_url: str = os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
+            max_connections: int = 50,
+            socket_timeout: float = 5.0,
+            socket_connect_timeout: float = 5.0
+        ):
+            """
+            Initialize Feature Store with Redis connection.
             
-            self.redis = redis.Redis(connection_pool=self.pool)
+            Args:
+                redis_url: Full Redis connection string (e.g., rediss://default:password@host:port)
+                max_connections: Max connections in pool
+                socket_timeout: Socket operation timeout in seconds
+                socket_connect_timeout: Socket connection timeout in seconds
+            """
+            self.redis_url = redis_url
             
-            # Test connection
-            self.redis.ping()
-            logger.info(f"✅ Connected to Redis at {redis_host}:{redis_port}")
+            try:
+                # Create connection pool directly from URL for better performance
+                self.pool = ConnectionPool.from_url(
+                    url=redis_url,
+                    max_connections=max_connections,
+                    socket_timeout=socket_timeout,
+                    socket_connect_timeout=socket_connect_timeout,
+                    decode_responses=True  # Auto-decode bytes to strings
+                )
+                
+                self.redis = redis.Redis(connection_pool=self.pool)
+                
+                # Test connection
+                self.redis.ping()
+                # We hide the full URL in the logs so we don't accidentally print the Upstash password!
+                logger.info("✅ Connected to Redis successfully via URL")
+                
+            except redis.ConnectionError as e:
+                logger.error(f"Failed to connect to Redis: {e}")
+                raise FeatureStoreError(f"Redis connection failed: {e}")    
             
-        except redis.ConnectionError as e:
-            logger.error(f"Failed to connect to Redis: {e}")
-            raise FeatureStoreError(f"Redis connection failed: {e}")
-    
     def sync_offline_to_online(self, parquet_path: str, feature_group_name: str, version: str = "v1", entity_key: str = "user_id", ttl_days: Optional[int] = None, batch_size: int = 1000) -> Dict[str, Any]:
         """
         Sync features from Parquet (offline) to Redis (online).
@@ -427,7 +418,7 @@ class FeatureStore:
         
         try:
             # Connect to Supabase
-            conn = await asyncpg.connect(database_url)
+            conn = await asyncpg.connect(database_url, statement_cache_size=0)
             
             # Query aggregated user features
             query = """
@@ -599,3 +590,5 @@ if __name__ == "__main__":
             print("Error: --parquet required")
             exit(1)
         fs.sync_from_supabase(args.parquet, "user_toxicity", "prod", 7)
+
+

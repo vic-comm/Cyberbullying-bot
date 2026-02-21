@@ -44,10 +44,14 @@ class DatabaseManager:
         logger.info("✅ Database schema initialized")
 
     async def _create_tables(self):
-        """Create tables if they don't exist"""
+        """Create tables, views, functions, and apply schema migrations if they don't exist"""
         async with self.pool.acquire() as conn:
             
-            # Users table (legacy - for backwards compatibility)
+            # ═══════════════════════════════════════════════════════════════
+            # 1. CORE TABLES
+            # ═══════════════════════════════════════════════════════════════
+            
+            # Users table (legacy)
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id TEXT PRIMARY KEY,
@@ -59,7 +63,7 @@ class DatabaseManager:
                 )
             ''')
 
-            # Logs table - MULTI-PLATFORM
+            # Logs table
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS logs (
                     id SERIAL PRIMARY KEY,
@@ -76,6 +80,7 @@ class DatabaseManager:
                 )
             ''')
 
+            # Server configs
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS server_configs (
                     server_id TEXT NOT NULL,
@@ -88,7 +93,7 @@ class DatabaseManager:
                 )
             ''')
 
-            # Server-specific user violations - MULTI-PLATFORM
+            # Server-specific user violations
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS server_user_violations (
                     id SERIAL PRIMARY KEY,
@@ -103,38 +108,132 @@ class DatabaseManager:
                 )
             ''')
 
-            # Indexes for performance
+            # ═══════════════════════════════════════════════════════════════
+            # 2. SCHEMA MIGRATIONS (e.g., Adding Pardon Columns safely)
+            # ═══════════════════════════════════════════════════════════════
+            
             await conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_logs_platform_user_time 
-                ON logs(platform, user_id, timestamp DESC)
+                ALTER TABLE server_user_violations
+                ADD COLUMN IF NOT EXISTS pardoned BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS pardoned_at TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS pardoned_by TEXT,
+                ADD COLUMN IF NOT EXISTS pardon_reason TEXT;
             ''')
 
+            # ═══════════════════════════════════════════════════════════════
+            # 3. FEEDBACK SYSTEM (Tables, Views, Functions)
+            # ═══════════════════════════════════════════════════════════════
+            
             await conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_logs_server_time 
-                ON logs(server_id, timestamp DESC)
+                CREATE TABLE IF NOT EXISTS feedback (
+                    id SERIAL PRIMARY KEY,
+                    log_id INTEGER NOT NULL REFERENCES logs(id) ON DELETE CASCADE,
+                    user_id TEXT NOT NULL,
+                    server_id TEXT NOT NULL,
+                    platform TEXT DEFAULT 'discord',
+                    predicted_label INTEGER NOT NULL,
+                    predicted_score REAL,
+                    predicted_severity TEXT,
+                    user_claimed_label INTEGER NOT NULL,
+                    dispute_reason TEXT,
+                    disputed_at TIMESTAMP DEFAULT NOW(),
+                    admin_reviewed BOOLEAN DEFAULT FALSE,
+                    admin_decision TEXT,
+                    final_label INTEGER,
+                    reviewed_by TEXT,
+                    reviewed_at TIMESTAMP,
+                    admin_notes TEXT,
+                    used_in_training BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(log_id)
+                );
+
+                -- Admin Review Queue View
+                CREATE OR REPLACE VIEW admin_review_queue AS
+                SELECT 
+                    f.id as feedback_id, f.log_id, f.user_id, f.server_id, f.platform, f.disputed_at,
+                    l.message as text, l.toxicity_score, l.severity, l.action_taken, l.timestamp as message_timestamp,
+                    f.predicted_label, f.predicted_score, f.user_claimed_label, f.dispute_reason,
+                    f.admin_reviewed, f.admin_decision, f.final_label, f.reviewed_by, f.reviewed_at,
+                    EXTRACT(EPOCH FROM (NOW() - f.disputed_at)) / 3600 AS hours_pending,
+                    (SELECT COUNT(*) FROM server_user_violations v WHERE v.user_id = f.user_id AND v.server_id = f.server_id AND v.platform = f.platform) as user_total_violations
+                FROM feedback f JOIN logs l ON f.log_id = l.id WHERE f.admin_reviewed = FALSE ORDER BY f.disputed_at ASC;
+
+                -- Uncertain Messages View
+                CREATE OR REPLACE VIEW uncertain_messages AS
+                SELECT 
+                    l.id as log_id, l.user_id, l.server_id, l.platform, l.message as text, l.toxicity_score, l.severity, l.action_taken, l.timestamp,
+                    EXISTS(SELECT 1 FROM feedback f WHERE f.log_id = l.id) as has_feedback,
+                    EXTRACT(EPOCH FROM (NOW() - l.timestamp)) / 3600 AS hours_ago
+                FROM logs l WHERE l.toxicity_score >= 0.3 AND l.toxicity_score <= 0.7 AND l.severity IN ('LOW', 'MEDIUM', 'UNCERTAIN') AND l.timestamp > NOW() - INTERVAL '7 days' ORDER BY l.timestamp DESC;
+
+                -- Function: Get pending review count
+                CREATE OR REPLACE FUNCTION get_pending_review_count(p_server_id TEXT) RETURNS INTEGER AS $$
+                BEGIN
+                    RETURN (SELECT COUNT(*) FROM feedback WHERE server_id = p_server_id AND admin_reviewed = FALSE) + 
+                           (SELECT COUNT(*) FROM uncertain_messages WHERE server_id = p_server_id AND has_feedback = FALSE);
+                END;
+                $$ LANGUAGE plpgsql;
+
+                -- Function: Record user dispute
+                CREATE OR REPLACE FUNCTION record_user_dispute(
+                    p_log_id INTEGER, p_user_id TEXT, p_server_id TEXT, p_platform TEXT, p_user_claimed_label INTEGER, p_dispute_reason TEXT DEFAULT NULL
+                ) RETURNS INTEGER AS $$
+                DECLARE v_feedback_id INTEGER; v_log RECORD;
+                BEGIN
+                    SELECT * INTO v_log FROM logs WHERE id = p_log_id;
+                    IF NOT FOUND THEN RAISE EXCEPTION 'Log ID % not found', p_log_id; END IF;
+                    INSERT INTO feedback (log_id, user_id, server_id, platform, predicted_label, predicted_score, predicted_severity, user_claimed_label, dispute_reason) 
+                    VALUES (p_log_id, p_user_id, p_server_id, p_platform, CASE WHEN v_log.severity IN ('LOW', 'MEDIUM', 'HIGH') THEN 1 ELSE 0 END, v_log.toxicity_score, v_log.severity, p_user_claimed_label, p_dispute_reason)
+                    ON CONFLICT (log_id) DO UPDATE SET user_claimed_label = EXCLUDED.user_claimed_label, dispute_reason = EXCLUDED.dispute_reason, disputed_at = NOW() RETURNING id INTO v_feedback_id;
+                    RETURN v_feedback_id;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                -- Function: Admin review decision
+                CREATE OR REPLACE FUNCTION admin_review_feedback(
+                    p_feedback_id INTEGER, p_admin_id TEXT, p_decision TEXT, p_final_label INTEGER DEFAULT NULL, p_notes TEXT DEFAULT NULL
+                ) RETURNS BOOLEAN AS $$
+                DECLARE v_feedback RECORD;
+                BEGIN
+                    SELECT * INTO v_feedback FROM feedback WHERE id = p_feedback_id;
+                    IF NOT FOUND THEN RAISE EXCEPTION 'Feedback ID % not found', p_feedback_id; END IF;
+                    IF p_decision = 'agree_with_model' THEN p_final_label := v_feedback.predicted_label;
+                    ELSIF p_decision = 'agree_with_user' THEN p_final_label := v_feedback.user_claimed_label;
+                    ELSIF p_final_label IS NULL THEN RAISE EXCEPTION 'Custom decision requires final_label'; END IF;
+                    UPDATE feedback SET admin_reviewed = TRUE, admin_decision = p_decision, final_label = p_final_label, reviewed_by = p_admin_id, reviewed_at = NOW(), admin_notes = p_notes WHERE id = p_feedback_id;
+                    RETURN TRUE;
+                END;
+                $$ LANGUAGE plpgsql;
+
+                -- Function: Bulk approve model
+                CREATE OR REPLACE FUNCTION bulk_approve_model(p_feedback_ids INTEGER[], p_admin_id TEXT) RETURNS INTEGER AS $$
+                DECLARE v_count INTEGER;
+                BEGIN
+                    UPDATE feedback SET admin_reviewed = TRUE, admin_decision = 'agree_with_model', final_label = predicted_label, reviewed_by = p_admin_id, reviewed_at = NOW() WHERE id = ANY(p_feedback_ids) AND admin_reviewed = FALSE;
+                    GET DIAGNOSTICS v_count = ROW_COUNT;
+                    RETURN v_count;
+                END;
+                $$ LANGUAGE plpgsql;
             ''')
 
+            # ═══════════════════════════════════════════════════════════════
+            # 4. INDEXES
+            # ═══════════════════════════════════════════════════════════════
+            
             await conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_logs_severity 
-                ON logs(severity, timestamp DESC) WHERE severity IN ('LOW', 'MEDIUM', 'HIGH')
+                CREATE INDEX IF NOT EXISTS idx_logs_platform_user_time ON logs(platform, user_id, timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_logs_server_time ON logs(server_id, timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_logs_severity ON logs(severity, timestamp DESC) WHERE severity IN ('LOW', 'MEDIUM', 'HIGH');
+                CREATE INDEX IF NOT EXISTS idx_server_violations_lookup ON server_user_violations(platform, server_id, user_id);
+                CREATE INDEX IF NOT EXISTS idx_server_configs_lookup ON server_configs(platform, server_id);
+                CREATE INDEX IF NOT EXISTS idx_logs_user_lookup ON logs(user_id);
+                CREATE INDEX IF NOT EXISTS idx_feedback_review_status ON feedback(admin_reviewed, created_at);
+                CREATE INDEX IF NOT EXISTS idx_feedback_server ON feedback(server_id, admin_reviewed);
+                CREATE INDEX IF NOT EXISTS idx_feedback_training ON feedback(used_in_training, admin_reviewed);
             ''')
 
-            await conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_server_violations_lookup 
-                ON server_user_violations(platform, server_id, user_id)
-            ''')
-
-            await conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_server_configs_lookup
-                ON server_configs(platform, server_id)
-            ''')
-
-            await conn.execute('''
-                CREATE INDEX IF NOT EXISTS idx_logs_user_lookup 
-                ON logs(user_id)
-            ''')
-
-            logger.info("✅ Tables and indexes created/verified")
+            logger.info("✅ Tables, Views, Functions, and Indexes verified/created")
 
     async def close(self):
         """Close database connection pool"""

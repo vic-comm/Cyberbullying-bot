@@ -7,11 +7,10 @@ from typing import Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 from unidecode import unidecode
 from discord.ext import commands
-from bot_service.init_db import init_database
 # Import internal modules
-from bot_service.database import DatabaseManager
-from bot_service.config import Config
-from bot_service.core.config_manager import ConfigManager
+from shared.database import DatabaseManager
+from discord_service.config import Config
+from shared.core.config_manager import ConfigManager
 
 class TextCleaner:
     """
@@ -123,9 +122,9 @@ class ModerationBot(commands.Bot):
         self.moderation_service = ModerationService(self)
         
         # Load Cogs
-        await self.load_extension('bot_service.cogs.admin')
-        await self.load_extension('bot_service.cogs.admin_review')
-        await self.load_extension('bot_service.cogs.moderation')
+        await self.load_extension('discord_service.cogs.admin')
+        await self.load_extension('discord_service.cogs.admin_review')
+        await self.load_extension('discord_service.cogs.moderation')
         
         print("✅ Bot setup complete (Database & Cogs loaded)")
 

@@ -342,7 +342,7 @@ mlflow
 dagshub
 evidently
 boto3
-s3fs
+
 
 # Deep Learning (CPU versions will be handled by Dockerfile logic if needed, but safe to list here)
 # torch is installed manually in Dockerfile to save time, but keeping it here is fine if unpinned
@@ -354,3 +354,6 @@ joblib
 pyyaml
 requests
 tqdm
+dvc[s3]
+lime==0.2.0.1
+s3fs>=2024.1.0

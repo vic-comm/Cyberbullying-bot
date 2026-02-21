@@ -1,14 +1,14 @@
 {
   "pipeline_metadata": {
-    "start_time": "2026-02-09T17:56:39.042814",
-    "end_time": "2026-02-09T17:57:09.841690",
-    "duration_seconds": 30.798876,
+    "start_time": "2026-02-19T10:31:00.299999",
+    "end_time": "2026-02-19T10:31:20.138321",
+    "duration_seconds": 19.838322,
     "pipeline_version": "1.0.0",
-    "mlflow_run_id": "ac0e095985db4fa39978f789eeda818c",
+    "mlflow_run_id": "82df5c94b2c847489c3c2cb1d4f9eb5a",
     "mlflow_experiment": "Drift_Monitoring_v3"
   },
   "decision": {
-    "timestamp": "2026-02-09T16:57:07.542368",
+    "timestamp": "2026-02-19T10:31:17.591265",
     "drift_detected": false,
     "severity": "none",
     "action": "no_action_needed",
@@ -27,12 +27,24 @@
     }
   },
   "statistical": {
-    "timestamp": "2026-02-09T17:56:45.810204",
-    "reference_samples": 207954,
-    "current_samples": 34,
+    "timestamp": "2026-02-19T10:31:06.651387",
+    "reference_samples": 157,
+    "current_samples": 984,
     "features": {},
     "overall_drift_detected": false,
     "drifted_features": [],
+    "label_distribution": {
+      "shift": 0.12442390347470354,
+      "ref_dist": {
+        "0": 0.7515923566878981,
+        "1": 0.2484076433121019
+      },
+      "cur_dist": {
+        "0": 0.8760162601626016,
+        "1": 0.12398373983739837
+      },
+      "drifted": false
+    },
     "drift_share": 0.0
   },
   "evidently": {
@@ -41,6 +53,6 @@
     "drifted_count": 0,
     "dataset_drift_detected": false,
     "report_path": "reports/drift_report.html",
-    "timestamp": "2026-02-09T17:57:01.991901"
+    "timestamp": "2026-02-19T10:31:10.613587"
   }
 }

@@ -7,8 +7,8 @@ from discord.ext import commands
 from discord import app_commands
 from typing import Optional
 
-from ..models.server_config import ServerConfig, ModerationAction
-from ..core.config_manager import ConfigManager
+from shared.models import ServerConfig, ModerationAction
+from shared.core.config_manager import ConfigManager
 
 class AdminCommands(commands.Cog):
     def __init__(self, bot):
@@ -1106,113 +1106,6 @@ class ThresholdModal(discord.ui.Modal, title="🎯 Detection Threshold Configura
                 f"❌ Invalid input: {e}",
                 ephemeral=True
             )
-
-
-# class ActionModal(discord.ui.Modal, title="⚙️ Action Configuration"):
-#     low_action = discord.ui.TextInput(
-#         label="Low severity action",
-#         placeholder="Options: warn, delete, timeout",
-#         max_length=10,
-#         required=True
-#     )
-    
-#     medium_action = discord.ui.TextInput(
-#         label="Medium severity action",
-#         placeholder="Options: warn, delete, timeout",
-#         max_length=10,
-#         required=True
-#     )
-    
-#     high_action = discord.ui.TextInput(
-#         label="High severity action",
-#         placeholder="Options: delete, timeout, kick, ban",
-#         max_length=10,
-#         required=True
-#     )
-    
-#     def __init__(self, config_manager: ConfigManager, config: ServerConfig, cog):
-#         super().__init__()
-#         self.config_manager = config_manager
-#         self.config = config
-#         self.cog = cog
-        
-#         self.low_action.default = config.low_severity_action
-#         self.medium_action.default = config.medium_severity_action
-#         self.high_action.default = config.high_severity_action
-    
-#     async def on_submit(self, interaction: discord.Interaction):
-#         valid_actions = ['warn', 'delete', 'timeout', 'kick', 'ban']
-        
-#         low = self.low_action.value.lower()
-#         med = self.medium_action.value.lower()
-#         high = self.high_action.value.lower()
-        
-#         # Validate
-#         if not all(action in valid_actions for action in [low, med, high]):
-#             await interaction.response.send_message(
-#                 f"❌ Invalid action. Must be one of: {', '.join(valid_actions)}",
-#                 ephemeral=True
-#             )
-#             return
-        
-#         self.config.low_severity_action = low
-#         self.config.medium_severity_action = med
-#         self.config.high_severity_action = high
-        
-#         await self.config_manager.save_config(self.config, platform='discord')
-        
-#         await interaction.response.send_message(
-#             "✅ Actions updated successfully!",
-#             ephemeral=True
-#         )
-
-
-# class FeatureModal(discord.ui.Modal, title="🔧 Feature Toggles"):
-#     auto_moderate = discord.ui.TextInput(
-#         label="Auto-moderate (true/false)",
-#         placeholder="Enable automatic moderation?",
-#         max_length=5,
-#         required=True
-#     )
-    
-#     send_dm = discord.ui.TextInput(
-#         label="Send DM warnings (true/false)",
-#         placeholder="DM users when they violate rules?",
-#         max_length=5,
-#         required=True
-#     )
-    
-#     require_review = discord.ui.TextInput(
-#         label="Require human review (true/false)",
-#         placeholder="Flag all violations for manual review?",
-#         max_length=5,
-#         required=True
-#     )
-    
-#     def __init__(self, config_manager: ConfigManager, config: ServerConfig, cog):
-#         super().__init__()
-#         self.config_manager = config_manager
-#         self.config = config
-#         self.cog = cog
-        
-#         self.auto_moderate.default = str(config.auto_moderate).lower()
-#         self.send_dm.default = str(config.send_dm_warnings).lower()
-#         self.require_review.default = str(config.require_human_review).lower()
-    
-#     async def on_submit(self, interaction: discord.Interaction):
-#         def parse_bool(value: str) -> bool:
-#             return value.lower() in ['true', '1', 'yes', 'on', 'enable', 'enabled']
-        
-#         self.config.auto_moderate = parse_bool(self.auto_moderate.value)
-#         self.config.send_dm_warnings = parse_bool(self.send_dm.value)
-#         self.config.require_human_review = parse_bool(self.require_review.value)
-        
-#         await self.config_manager.save_config(self.config, platform='discord')
-        
-#         await interaction.response.send_message(
-#             "✅ Features updated successfully!",
-#             ephemeral=True
-#         )
 
 class ActionConfigView(discord.ui.View):
     def __init__(self, config_manager, config, parent_view):

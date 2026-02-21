@@ -46,6 +46,9 @@ TOXIC_KEYWORDS = {
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs')
 LOG_FILE = os.path.join(LOG_DIR, 'ingestion.log')
+LOW_CONFIDENCE_THRESHOLD = 0.3  # 0.3
+HIGH_CONFIDENCE_THRESHOLD = 0.7   # 0.7
+HIGH_CONFIDENCE_SAMPLE_RATE = 0.05
 
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(FEATURE_CONFIG_PATH, exist_ok=True)
@@ -84,7 +87,7 @@ async def fetch_training_data_stratified(
     logger.info(f"   Strategy: 5% anchors + 100% admin-reviewed")
     
     try:
-        conn = await asyncpg.connect(DATABASE_URL)
+        conn = await asyncpg.connect(DATABASE_URL, statement_cache_size=0)
         
         # ───────────────────────────────────────────────────────
         # PART 1: HIGH-CONFIDENCE ANCHORS (5% sample)
@@ -497,20 +500,28 @@ def merge_and_save(new_df: pd.DataFrame) -> Dict[str, Any]:
         # A. DOWNLOAD HISTORY
         pull_master_data()
         
+        for col in ['user_id', 'server_id', 'platform']:
+            if col in new_df.columns:
+                new_df[col] = new_df[col].astype(str)
+
         # B. LOAD
         if os.path.exists(MASTER_DATA_PATH):
             master_df = pd.read_parquet(MASTER_DATA_PATH)
             stats["master_size_before"] = len(master_df)
+
+            for col in ['user_id', 'server_id', 'platform']:
+                if col in master_df.columns:
+                    master_df[col] = master_df[col].astype(str)
         else:
             master_df = pd.DataFrame()
             stats["master_size_before"] = 0
             
         # C. ALIGN COLUMNS (Fix mismatch errors)
-        if not master_df.empty:
-            for col in master_df.columns:
-                if col not in new_df.columns:
-                    new_df[col] = 0 if pd.api.types.is_numeric_dtype(master_df[col]) else None
-            new_df = new_df[master_df.columns.intersection(new_df.columns)]
+        # if not master_df.empty:
+        #     for col in master_df.columns:
+        #         if col not in new_df.columns:
+        #             new_df[col] = 0 if pd.api.types.is_numeric_dtype(master_df[col]) else None
+        #     new_df = new_df[master_df.columns.intersection(new_df.columns)]
 
         # D. MERGE
         combined_df = pd.concat([master_df, new_df], ignore_index=True)
@@ -612,7 +623,7 @@ def validate_incoming_data(new_data: pd.DataFrame) -> Optional[pd.DataFrame]:
     
 # MAIN FLOW
 @flow(name="Data Ingestion Pipeline", log_prints=True)
-def data_ingestion_flow(new_data: pd.DataFrame = None):
+def data_ingestion_flow(new_data: Optional[pd.DataFrame] = None):
     logger.info("🚀 Starting data ingestion pipeline...")
     if not new_data:
         new_data = load_and_validate_logs()

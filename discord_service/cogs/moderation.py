@@ -3,8 +3,8 @@ from discord.ext import commands
 from datetime import timedelta
 from typing import Optional, Dict, Any
 import asyncio
-from ..database import ViolationLevel
-from ..models.server_config import ServerConfig
+from shared.database import ViolationLevel
+from shared.models.server_config import ServerConfig
 import aiohttp
 import logging
 import json
@@ -86,6 +86,7 @@ class ModerationCog(commands.Cog):
                     config=config
                 )
             )
+
     async def generate_explanation_async(
         self,
         log_id: int,
@@ -256,8 +257,18 @@ class ModerationCog(commands.Cog):
         user_id = str(message.author.id)
         log_id = None
         if severity == ViolationLevel.SAFE:
-            return
-        
+            log_id = await self.bot.db.log_event(
+                user_id=user_id,
+                server_id=server_id,
+                platform='discord',
+                message=message.content,
+                score=confidence,
+                severity=severity.value,
+                action=None,
+                explanation=None,
+                metadata={"channel_id": str(message.channel.id)}
+            )
+
         elif severity == ViolationLevel.UNCERTAIN:
             # Flag for review
             log_id = await self.bot.db.log_event(
@@ -524,8 +535,6 @@ class ModerationCog(commands.Cog):
         Let users see why their last message was flagged.
         Usage: !why
         """
-        logger.info(f"DEBUG !explain triggered by {ctx.author.name}")
-        logger.info(f"DEBUG server_id: {ctx.guild.id}, user_id: {ctx.author.id}")
         server_id = str(ctx.guild.id)
         user_id = str(ctx.author.id)
         
@@ -537,15 +546,10 @@ class ModerationCog(commands.Cog):
         recent_log = await self.bot.db.get_latest_user_violation(
             server_id, user_id, platform='discord', hours=24 
         )
-
-        logger.info(f"DEBUG recent_log: {recent_log}")
         
         if not recent_log:
             await ctx.send("✅ No violations found in the last 24 hours.", delete_after=10)
             return
-
-        logger.info(f"DEBUG message: '{recent_log.get('message', 'MISSING')}'")
-        logger.info(f"DEBUG existing explanation: {recent_log.get('explanation')}")
 
         # 3. Check/Generate Explanation
         explanation = recent_log.get('explanation')
@@ -567,8 +571,6 @@ class ModerationCog(commands.Cog):
                 "channel_id": str(ctx.channel.id),
                 "num_features": 6
             }
-            logger.info(f"DEBUG payload: {payload}")
-            logger.info(f"DEBUG API URL: {self.bot.config.API_BASE_URL}/explain")
             try:
                 async with self.bot.session.post(
                     f"{self.bot.config.API_BASE_URL}/explain",
@@ -598,7 +600,7 @@ class ModerationCog(commands.Cog):
             explanation=explanation,
             original_text=recent_log['message'],
             user=ctx.author,
-            fallback_score=recent_log.get('toxicity_score', 0.0)
+            toxicity_score=recent_log.get('toxicity_score', 0.0)
         )
         
         # Add a footer specific to this command
@@ -658,7 +660,7 @@ async def setup(bot):
     await bot.add_cog(ModerationCog(bot))
 
 
-def create_explanation_embed(explanation: dict, original_text: str, user: discord.User, fallback_score: float = 0.0):
+def create_explanation_embed(explanation: dict, original_text: str, user: discord.User, toxicity_score: float = 0.0):
     """
     Converts API JSON explanation into a Discord Embed.
     """
@@ -666,18 +668,10 @@ def create_explanation_embed(explanation: dict, original_text: str, user: discor
         try:
             explanation = json.loads(explanation)
         except json.JSONDecodeError:
-            # If it fails to parse, create a fallback dict so .get() doesn't crash
             explanation = {}
     # 1. Extract Core Data
-
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.info(f"create_explanation_embed received keys: {list(explanation.keys())}")
-    logger.info(f"original_text: '{original_text[:50] if original_text else 'EMPTY'}'")
-    # ────────────────────────────────────────────────────────────────
-    score = explanation.get('toxic_probability', 0.0)
-    if score is None:
-        score = fallback_score
+    score=toxicity_score
+    
     triggers = explanation.get('trigger_words', [])
     features = explanation.get('features_used', {})
     

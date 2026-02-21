@@ -322,7 +322,7 @@ def population_stability_index(ref_data: pd.Series, cur_data: pd.Series, bins: i
         logger.warning(f"PSI calculation failed: {e}")
         return None
 
-# @task(name="Detect Statistical Drift", log_prints=True)
+@task(name="Detect Statistical Drift", log_prints=True)
 def detect_statistical_drift(
     reference: pd.DataFrame,
     current: pd.DataFrame
@@ -423,7 +423,7 @@ def detect_statistical_drift(
     return drift_results
 
 
-# @task(name="Generate Evidently Report", log_prints=True)
+@task(name="Generate Evidently Report", log_prints=True)
 def generate_evidently_report(reference: pd.DataFrame, current: pd.DataFrame) -> Dict[str, Any]:
 
     logger.info("📊 Generating Evidently drift report...")
@@ -444,8 +444,7 @@ def generate_evidently_report(reference: pd.DataFrame, current: pd.DataFrame) ->
         
         report = Report(metrics=[
             DataSummaryPreset(include_tests=True),
-            DataDriftPreset(drift_share=DRIFT_THRESHOLDS["dataset_drift_share"]),
-            TextEvals(descriptors=text_descriptors),
+            DataDriftPreset(drift_share=DRIFT_THRESHOLDS["dataset_drift_share"])
         ], include_tests=True)
         
         report_snapshot = report.run(reference_data=ref_ds, current_data=cur_ds)
@@ -523,7 +522,7 @@ def generate_evidently_report(reference: pd.DataFrame, current: pd.DataFrame) ->
             "timestamp": datetime.now().isoformat(),
         }
 
-# @task(name="Make Drift Decision", log_prints=True)
+@task(name="Make Drift Decision", log_prints=True)
 def make_drift_decision(
     statistical_results: Dict[str, Any],
     evidently_results: Dict[str, Any],
@@ -676,7 +675,7 @@ def send_slack_alert(drift_results: Dict[str, Any]):
     except Exception as e:
         logger.error(f"❌ Failed to send Slack alert: {e}")
 
-# @task(name="Send Alerts", log_prints=True)
+@task(name="Send Alerts", log_prints=True)
 def send_alerts(drift_results: Dict[str, Any]):
     """
     Send alerts via configured channels if drift detected.
@@ -701,7 +700,7 @@ def send_alerts(drift_results: Dict[str, Any]):
         # Implement PagerDuty integration here
 
 # METRICS PERSISTENCE
-# @task(name="Save Drift Metrics", log_prints=True)
+@task(name="Save Drift Metrics", log_prints=True)
 def save_drift_metrics(drift_results: Dict[str, Any]):
     """
     Save drift metrics to JSON and historical log.
@@ -734,8 +733,8 @@ def save_drift_metrics(drift_results: Dict[str, Any]):
     except Exception as e:
         logger.error(f"❌ Failed to save metrics: {e}")
 
-
-def drift_detection_flow(current_data: pd.Dataframe = None):
+@flow()
+def drift_detection_flow(current_data: Optional[pd.DataFrame] = None):
     start_time = datetime.now()
     logger = get_run_logger()
     logger.info("🚀 Starting drift detection pipeline...")

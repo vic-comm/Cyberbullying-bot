@@ -13,3 +13,5 @@ prometheus-client
 python-dotenv
 scikit-learn==1.6.1 
 fastapi-utils
+lime==0.2.0.1
+typing-inspect==0.9.0

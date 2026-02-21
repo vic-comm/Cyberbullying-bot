@@ -41,6 +41,7 @@ STAGE = os.getenv("MODEL_STAGE", "Production")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 BUCKET_NAME = os.getenv("BUCKET_NAME") 
 S3_LOGS_KEY = os.getenv("S3_LOGS_KEY", "logs/raw_logs.jsonl") 
+REDIS_URL = os.getenv("REDIS_URL")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
@@ -126,8 +127,8 @@ async def lifespan(app: FastAPI):
     # 1. Initialize Feature Store
     # -------------------------------------------------
     try:
-        fs = FeatureStore(redis_host=REDIS_HOST, redis_port=REDIS_PORT)
-        logger.info(f"✅ Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+        fs = FeatureStore(redis_url=REDIS_URL)
+        logger.info(f"✅ Connected to Redis at {REDIS_URL}")
     except Exception as e:
         logger.error(f"❌ Failed to connect to Redis: {e}")
         logger.warning("⚠️ API will start but feature enrichment will fail")
@@ -564,6 +565,7 @@ class ExplanationRequest(BaseModel):
     
     class Config:
         extra = "allow"
+        
 @app.post("/explain")
 async def explain_text(payload: ExplanationRequest):
     """

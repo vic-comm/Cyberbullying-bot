@@ -12,8 +12,6 @@ class Config:
     # Global Bot Settings (Not Server Specific)
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     
-    # Feature Flags (Global Kill-Switches)
-    # These are okay to keep if you want to disable features for the ENTIRE bot
     ENABLE_API = True 
     ENABLE_FALLBACK_DETECTION = True
 

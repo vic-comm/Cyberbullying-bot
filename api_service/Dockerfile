@@ -15,7 +15,9 @@ RUN pip install --no-cache-dir --default-timeout=1000 transformers==4.57.6
 COPY api_service/requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir asyncpg==0.29.0 pyarrow==15.0.0
 
+COPY shared/ /app/shared/
 COPY api_service/ /app/api_service/
 COPY mlops/ /app/mlops/
 COPY scripts/ /app/scripts/

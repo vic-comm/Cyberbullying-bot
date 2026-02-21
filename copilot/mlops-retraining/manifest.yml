@@ -1,36 +1,29 @@
-# The manifest for the "api" service.
-# Read the full specification for the "Load Balanced Web Service" type at:
-#  https://aws.github.io/copilot-cli/docs/manifest/lb-web-service/
+# The manifest for the "mlops-retraining" job.
+# Read the full specification for the "Scheduled Job" type at:
+#  https://aws.github.io/copilot-cli/docs/manifest/scheduled-job/
 
-# Your service name will be used in naming your resources like log groups, ECS services, etc.
-name: api
-type: Load Balanced Web Service
+# Your job name will be used in naming your resources like log groups, ECS Tasks, etc.
+name: mlops-retraining
+type: Scheduled Job
 
-# Distribute traffic to your service.
-http:
-  # Requests to this path will be forwarded to your service.
-  # To match all requests you can use the "/" path.
-  path: '/'
-  # You can specify a custom health check path. The default is "/".
-  # healthcheck: '/'
+# Trigger for your task.
+on:
+  # The scheduled trigger for your job. You can specify a Unix cron schedule or keyword (@weekly) or a rate (@every 1h30m)
+  # AWS Schedule Expressions are also accepted: https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html
+  schedule: "rate(14 days)"
+#retries: 3        # Optional. The number of times to retry the job before failing.
+#timeout: 1h30m    # Optional. The timeout after which to stop the job if it's still running. You can use the units (h, m, s).
 
-# Configuration for your containers and service.
+# Configuration for your container and task.
 image:
   build:
-    dockerfile: api_service/Dockerfile
+    dockerfile: mlops/Dockerfile
     context: .
-  port: 8000
+  command: ["python", "-m", "mlops.pipeline", "--mode", "run", "--dvc"]
 
-cpu: 256       # Number of CPU units for the task.
-memory: 512    # Amount of memory in MiB used by the task.
-platform: linux/x86_64  # See https://aws.github.io/copilot-cli/docs/manifest/lb-web-service/#platform
-count: 1       # Number of tasks that should be running in your service.
-exec: true     # Enable running commands in your container.
-network:
-  connect: true # Enable Service Connect for intra-environment traffic between services.
-
-# storage:
-  # readonly_fs: true       # Limit to read-only access to mounted root filesystems.
+cpu: 1024       # Number of CPU units for the task.
+memory: 2048    # Amount of memory in MiB used by the task.
+platform: linux/x86_64   # See https://aws.github.io/copilot-cli/docs/manifest/scheduled-job/#platform
 
 # Optional fields for more advanced use-cases.
 #
@@ -42,10 +35,21 @@ network:
 
 # You can override any of the values defined above by environment.
 #environments:
-#  test:
-#    count: 2               # Number of tasks to run for the "test" environment.
-#    deployment:            # The deployment strategy for the "test" environment.
-#       rolling: 'recreate' # Stops existing tasks before new ones are started for faster deployments.
+#  prod:
+#    cpu: 2048               # Larger CPU value for prod environment.
+# Grant the container permission to talk to your DVC S3 bucket
+iam:
+  policy:
+    Statement:
+      - Effect: Allow
+        Action:
+          - s3:ListBucket
+          - s3:GetObject
+          - s3:PutObject
+          - s3:DeleteObject
+        Resource:
+          - arn:aws:s3:::cyberbullying-artifacts-victor-obi
+          - arn:aws:s3:::cyberbullying-artifacts-victor-obi/*
 
 variables:
   MLFLOW_TRACKING_URI: "https://dagshub.com/obiezuevictor/Cyberbullying-bot.mlflow"
