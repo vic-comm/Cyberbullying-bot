@@ -133,47 +133,28 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ Failed to connect to Redis: {e}")
         logger.warning("⚠️ API will start but feature enrichment will fail")
     
-    # -------------------------------------------------
-    # 2. Load Model
-    # -------------------------------------------------
+    
     try:
-        local_path = os.getenv("MODEL_LOCAL_PATH", "/app/baked_model")
+        logger.info("☁️ Loading model directly from DagsHub/MLflow...")
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        model_uri = f"models:/{EXPERIMENT_NAME}/{STAGE}"
         
-        if os.path.exists(local_path):
-            logger.info(f"📂 Found BAKED model at: {local_path}")
-            model = mlflow.pyfunc.load_model(local_path)
-            
-            model_meta.update({
-                "version": "baked-in-prod",
-                "loaded_at": datetime.now().isoformat(),
-                "source": "local_container"
-            })
-            logger.info("✅ Loaded model from local container (Offline Mode)")
-            
-        else:
-            logger.warning(
-                f"⚠️ No local model found at {local_path}. Attempting remote download..."
-            )
-            
-            mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-            model_uri = f"models:/{EXPERIMENT_NAME}/{STAGE}"
-            
-            logger.info(f"☁️ Loading from MLflow: {model_uri}")
-            model = mlflow.pyfunc.load_model(model_uri)
-            
-            try:
-                client = MlflowClient()
-                versions = client.get_latest_versions(EXPERIMENT_NAME, stages=[STAGE])
-                if versions:
-                    model_meta["version"] = versions[0].version
-            except Exception:
-                model_meta["version"] = "remote-unknown"
+        logger.info(f"Downloading from: {model_uri}")
+        model = mlflow.pyfunc.load_model(model_uri)
+        
+        try:
+            client = MlflowClient()
+            versions = client.get_latest_versions(EXPERIMENT_NAME, stages=[STAGE])
+            if versions:
+                model_meta["version"] = versions[0].version
+        except Exception:
+            model_meta["version"] = "remote-unknown"
 
-            logger.info("✅ Loaded model from MLflow Registry")
+        logger.info(f"✅ Loaded model v{model_meta['version']} from MLflow Registry")
 
     except Exception as e:
-        logger.error(f"❌ CRITICAL: Failed to load model: {e}", exc_info=True)
-    
+        logger.error(f"❌ CRITICAL: Failed to load model from DagsHub: {e}", exc_info=True)
+
     if model is not None:
         try:
             explainer_service = ToxicityExplainer(

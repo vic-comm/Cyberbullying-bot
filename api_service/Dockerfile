@@ -16,6 +16,8 @@ COPY api_service/requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir asyncpg==0.29.0 pyarrow==15.0.0
+RUN pip install --no-cache-dir --upgrade "numpy>=2.0.0"
+RUN pip install --no-cache-dir "scikit-learn==1.8.0" --upgrade xgboost
 
 COPY shared/ /app/shared/
 COPY api_service/ /app/api_service/
