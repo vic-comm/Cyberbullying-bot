@@ -77,7 +77,8 @@ AntiBully solves all three by combining state-of-the-art NLP, explainable AI, an
 - **Spam Protection**: Detects coordinated attacks, flooding, repetition
 - **Protected Patterns**: Slurs never overridden by user feedback
 - **Audit Trail**: Every action logged with timestamps and admin IDs
-
+  
+### DEMO: https://youtu.be/H17_tdERf5g
 ---
 
 ## 🏗️ System Architecture
