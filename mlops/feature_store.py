@@ -52,14 +52,15 @@ class FeatureStore:
                     max_connections=max_connections,
                     socket_timeout=socket_timeout,
                     socket_connect_timeout=socket_connect_timeout,
-                    decode_responses=True  # Auto-decode bytes to strings
+                    decode_responses=True,  # Auto-decode bytes to strings
+                    health_check_interval=15,   # Pings Upstash every 15s to keep the AWS socket alive
+                    retry_on_timeout=True
                 )
                 
                 self.redis = redis.Redis(connection_pool=self.pool)
                 
                 # Test connection
                 self.redis.ping()
-                # We hide the full URL in the logs so we don't accidentally print the Upstash password!
                 logger.info("✅ Connected to Redis successfully via URL")
                 
             except redis.ConnectionError as e:

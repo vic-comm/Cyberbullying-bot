@@ -128,7 +128,6 @@ async def lifespan(app: FastAPI):
     # -------------------------------------------------
     try:
         fs = FeatureStore(redis_url=REDIS_URL)
-        logger.info(f"✅ Connected to Redis at {REDIS_URL}")
     except Exception as e:
         logger.error(f"❌ Failed to connect to Redis: {e}")
         logger.warning("⚠️ API will start but feature enrichment will fail")
